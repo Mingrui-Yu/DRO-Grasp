@@ -222,4 +222,4 @@ If you find our codes or models useful in your work, please cite [our paper](htt
 
 ## Contact
 
-If you have any questions, feel free to contact me through email ([Zhenyu_Wei@sjtu.edu.cn](mailto:Zhenyu_Wei@sjtu.edu.cn))!
+If you have any questions, feel free to contact me through email ([wzhenyu@cs.unc.edu](mailto:wzhenyu@cs.unc.edu))!
