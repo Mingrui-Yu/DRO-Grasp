@@ -5,6 +5,8 @@ lightning_logs/
 
 ckpt/
 data/
+ckpt-v1.0.zip
+data-v1.0.zip
 output/
 outputs/
 tmp/

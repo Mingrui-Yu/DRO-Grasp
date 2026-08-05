@@ -1,0 +1,26 @@
+{
+  "robot_name": "shadowhand",
+  "scene_root": "../BimanBODex/src/curobo/content/assets/object/DGN_2k/scene_cfg",
+  "reference_grasp_roots": [
+    "../BimanBODex/src/curobo/content/assets/output/sim_shadow/tabletop_full/single_type_DGN2k_1000/graspdata"
+  ],
+  "scene_list": null,
+  "expected_scene_count": 996,
+  "expected_scene_manifest_sha256": "9180845ed969e52be69cb31892536adafdfa725c6901a279d4dd793728037596",
+  "expected_scale_range": [0.02, 0.30],
+  "checkpoint": "ckpt/model/model_3robots.pth",
+  "shadow_urdf": "data/data_urdf/robot/shadowhand/shadow_hand_right_extended.urdf",
+  "shadow_point_cloud": "data/PointCloud/robot/shadowhand.pt",
+  "point_cloud_mode": "complete_scaled_mesh",
+  "frame_contract": "object_local_no_normalization",
+  "network_center_robot_pc": true,
+  "point_count": 512,
+  "point_seed": 240824,
+  "candidate_count": 20,
+  "inference_seed": 240825,
+  "n_iter": 64,
+  "device": "cuda:0",
+  "failure_policy": "scene_atomic_all_candidates_fail",
+  "output_root": null,
+  "max_scenes": null
+}
