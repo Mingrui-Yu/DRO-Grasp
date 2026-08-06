@@ -20,8 +20,10 @@ from .contracts import (
     RAW_SCHEMA_VERSION,
     RUN_SCHEMA_VERSION,
     STAGE_NAMES,
+    clamp_dro_shadow_export_stages,
     discover_scene_paths,
     load_scene_record,
+    load_dro_shadow_finger_joint_limits,
     make_bench_artifact,
     sample_scaled_surface,
     scene_manifest_sha256,
@@ -264,6 +266,9 @@ def dry_run(repo_root: Path, config: dict) -> dict:
     points = sample_scaled_surface(
         first.mesh_path, first.scale, resolved["point_count"], point_seed
     )
+    shadow_finger_joint_limits = load_dro_shadow_finger_joint_limits(
+        Path(resolved["shadow_urdf"])
+    )
     return {
         "status": "dry_run",
         "scene_count": len(records),
@@ -276,6 +281,9 @@ def dry_run(repo_root: Path, config: dict) -> dict:
         "first_scene_point_cloud_sha256": sha256_array(points),
         "checkpoint_sha256": sha256_file(Path(resolved["checkpoint"])),
         "shadow_urdf_sha256": sha256_file(Path(resolved["shadow_urdf"])),
+        "shadow_finger_joint_limits": {
+            name: list(limit) for name, limit in shadow_finger_joint_limits.items()
+        },
         "shadow_point_cloud_sha256": sha256_file(Path(resolved["shadow_point_cloud"])),
         "resolved_config": resolved,
     }
@@ -495,6 +503,9 @@ def run(repo_root: Path, config: dict, inference=None) -> dict:
     repo_root = Path(repo_root).resolve(strict=True)
     resolved = resolve_config(repo_root, config)
     source_records, records = resolve_scene_records(resolved)
+    shadow_finger_joint_limits = load_dro_shadow_finger_joint_limits(
+        Path(resolved["shadow_urdf"])
+    )
     output_value = resolved.get("output_root")
     if not output_value:
         raise ValueError("output_root is required outside dry-run")
@@ -617,10 +628,17 @@ def run(repo_root: Path, config: dict, inference=None) -> dict:
             elif scene_failure is None:
                 try:
                     export_started = time.perf_counter()
-                    artifact, limit_excess = make_bench_artifact(
-                        stage_q, record.object_pose_wxyz, record.stored_scene_path
+                    export_stage_q, clamp_diagnostics = clamp_dro_shadow_export_stages(
+                        stage_q, shadow_finger_joint_limits
                     )
-                    validate_artifact(artifact, record, stage_q)
+                    raw["export_stage_q"] = export_stage_q
+                    raw["export_clamp_diagnostics"] = clamp_diagnostics
+                    artifact, limit_excess = make_bench_artifact(
+                        export_stage_q,
+                        record.object_pose_wxyz,
+                        record.stored_scene_path,
+                    )
+                    validate_artifact(artifact, record, export_stage_q)
                     raw["bench_joint_limit_excess"] = limit_excess
                     raw["export_seconds"] = time.perf_counter() - export_started
                     _write_scene_pair(grasp_path, raw_path, artifact, raw)
@@ -702,6 +720,9 @@ def validate_run_outputs(output_root: Path) -> dict:
         raise ValueError("failure manifest and scene statuses disagree")
 
     resolved = manifest["resolved_config"]
+    shadow_finger_joint_limits = load_dro_shadow_finger_joint_limits(
+        Path(resolved["shadow_urdf"])
+    )
     source_records, selected_records = resolve_scene_records(resolved)
     if manifest.get("source_scene_count") != len(source_records):
         raise ValueError("persisted source scene count does not match current inputs")
@@ -744,6 +765,22 @@ def validate_run_outputs(output_root: Path) -> dict:
             stage_q = np.asarray(raw.get("stage_q"))
             if stage_q.shape != (candidate_count, 3, len(DRO_SHADOW_Q_NAMES)):
                 raise ValueError(f"stage q shape mismatch for {record.scene_id}")
+            if not np.isfinite(stage_q).all():
+                raise ValueError(f"stage q contains non-finite values for {record.scene_id}")
+            export_stage_q = np.asarray(raw.get("export_stage_q"))
+            if export_stage_q.shape != stage_q.shape or not np.isfinite(
+                export_stage_q
+            ).all():
+                raise ValueError(f"export stage q mismatch for {record.scene_id}")
+            expected_export_q, expected_diagnostics = clamp_dro_shadow_export_stages(
+                stage_q, shadow_finger_joint_limits
+            )
+            if not np.array_equal(export_stage_q, expected_export_q):
+                raise ValueError(
+                    f"export stage q does not match the approved clamp for {record.scene_id}"
+                )
+            if raw.get("export_clamp_diagnostics") != expected_diagnostics:
+                raise ValueError(f"export clamp diagnostics mismatch for {record.scene_id}")
             initial_q = np.asarray(raw.get("initial_q"))
             timings = np.asarray(raw.get("timing_seconds"))
             if initial_q.shape != (candidate_count, len(DRO_SHADOW_Q_NAMES)):
@@ -755,7 +792,19 @@ def validate_run_outputs(output_root: Path) -> dict:
             export_seconds = raw.get("export_seconds")
             if not isinstance(export_seconds, float) or export_seconds < 0.0:
                 raise ValueError(f"export timing contract mismatch for {record.scene_id}")
-            validate_artifact(artifact, record, stage_q)
+            expected_artifact, expected_excess = make_bench_artifact(
+                export_stage_q,
+                record.object_pose_wxyz,
+                record.stored_scene_path,
+            )
+            persisted_excess = np.asarray(raw.get("bench_joint_limit_excess"))
+            if persisted_excess.shape != expected_excess.shape or not np.array_equal(
+                persisted_excess, expected_excess
+            ):
+                raise ValueError(f"joint-limit diagnostics mismatch for {record.scene_id}")
+            if not np.array_equal(artifact["robot_pose"], expected_artifact["robot_pose"]):
+                raise ValueError(f"artifact export mismatch for {record.scene_id}")
+            validate_artifact(artifact, record, export_stage_q)
             completed_scenes += 1
         elif scene["status"] == "failed":
             failed_raw_path = output_root / scene["failed_raw_artifact"]

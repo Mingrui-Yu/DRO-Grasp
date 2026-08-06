@@ -20,8 +20,11 @@ official Isaac Gym evaluator.
   floating forearm pose plus `WRJ2/WRJ1`; these wrist joints are not silently
   dropped into the Bench finger vector.
 - Hand mapping: the released URDF and Bench MJCF share right-hand finger joint
-  semantics. Export adds the `rh_` namespace and reorders by name. A numerical
-  validator checks joint limits and palm-local FK landmarks.
+  semantics. Export adds the `rh_` namespace and reorders by name. The official
+  raw controller stages are retained unchanged; an export-only copy clamps
+  finger joints to the intersection of the released DRO URDF and Bench limits,
+  with every changed value recorded in raw diagnostics. A numerical validator
+  checks joint limits and palm-local FK landmarks.
 - Stages: the official `controller()` output is exported as
   `q_outer -> pregrasp`, optimized `q -> grasp`, and `q_inner -> squeeze`.
 - Budget: exactly 20 raw candidates per scene. Candidate seeds and ordering are
@@ -43,6 +46,11 @@ The Bench-facing artifact remains unchanged:
 
 DRO-specific provenance is stored only in `raw/`, `run_manifest.json`,
 `failure_manifest.json`, and `resolved_config.json`.
+
+Each successful raw artifact stores `stage_q` as the untouched official
+`q_outer/q/q_inner` result and `export_stage_q` as the Bench-facing clamped
+copy. `export_clamp_diagnostics` records the candidate, stage, joint, raw and
+clamped values, delta, and both source limit intervals for every clamp.
 
 ## Assets and environment
 

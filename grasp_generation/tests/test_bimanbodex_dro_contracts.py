@@ -11,7 +11,9 @@ import numpy as np
 from grasp_generation.experiments.bimanbodex_dro.contracts import (
     BENCH_SHADOW_JOINT_NAMES,
     DRO_SHADOW_Q_NAMES,
+    DRO_SHADOW_FINGER_JOINT_NAMES,
     STAGE_NAMES,
+    clamp_dro_shadow_export_stages,
     dro_q_to_bench_pose,
     dro_q_to_object_palm_transform,
     load_scene_record,
@@ -123,6 +125,33 @@ class ContractTests(unittest.TestCase):
             artifact["robot_pose"][0, 0, :, :7],
             np.repeat(artifact["robot_pose"][0, 0, 1:2, :7], 3, axis=0),
         )
+
+    def test_export_clamp_uses_limit_intersection_without_mutating_raw_q(self):
+        raw = np.zeros((2, 3, len(DRO_SHADOW_Q_NAMES)), dtype=np.float32)
+        raw[0, 1, DRO_SHADOW_Q_NAMES.index("THJ3")] = 0.5
+        raw[1, 2, DRO_SHADOW_Q_NAMES.index("FFJ2")] = -0.5
+        original = raw.copy()
+        dro_limits = {
+            name: (-10.0, 10.0) for name in DRO_SHADOW_FINGER_JOINT_NAMES
+        }
+        dro_limits["THJ3"] = (-0.1, 0.1)
+        export, diagnostics = clamp_dro_shadow_export_stages(raw, dro_limits)
+
+        np.testing.assert_array_equal(raw, original)
+        np.testing.assert_array_equal(raw[:, :, :8], export[:, :, :8])
+        self.assertAlmostEqual(
+            float(export[0, 1, DRO_SHADOW_Q_NAMES.index("THJ3")]), 0.1, places=6
+        )
+        self.assertAlmostEqual(
+            float(export[1, 2, DRO_SHADOW_Q_NAMES.index("FFJ2")]), 0.0, places=6
+        )
+        self.assertEqual(len(diagnostics), 2)
+        self.assertEqual(
+            {(item["candidate_index"], item["stage_name"], item["bench_joint_name"])
+             for item in diagnostics},
+            {(0, "grasp", "rh_THJ3"), (1, "squeeze", "rh_FFJ2")},
+        )
+        self.assertAlmostEqual(diagnostics[0]["delta"], -0.4, places=6)
 
     def test_world_export_uses_object_pose_composition(self):
         q = np.zeros(len(DRO_SHADOW_Q_NAMES), dtype=np.float64)

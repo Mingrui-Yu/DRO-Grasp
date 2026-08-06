@@ -10,7 +10,10 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from grasp_generation.experiments.bimanbodex_dro.contracts import DRO_SHADOW_Q_NAMES
+from grasp_generation.experiments.bimanbodex_dro.contracts import (
+    DRO_SHADOW_FINGER_JOINT_NAMES,
+    DRO_SHADOW_Q_NAMES,
+)
 from grasp_generation.experiments.bimanbodex_dro.runner import (
     _batch_robot_point_cloud,
     _controller_stages_on_cpu,
@@ -55,8 +58,17 @@ class RunnerTests(unittest.TestCase):
         self.checkpoint = self.root / "model_3robots.pth"
         self.urdf = self.root / "shadow.urdf"
         self.robot_pc = self.root / "shadowhand.pt"
-        for path in (self.checkpoint, self.urdf, self.robot_pc):
-            path.write_bytes(path.name.encode("utf-8"))
+        self.checkpoint.write_bytes(self.checkpoint.name.encode("utf-8"))
+        self.robot_pc.write_bytes(self.robot_pc.name.encode("utf-8"))
+        urdf = ["<robot name=\"shadow\">"]
+        for joint_name in DRO_SHADOW_FINGER_JOINT_NAMES:
+            urdf.append(
+                f'<joint name="{joint_name}" type="revolute">'
+                '<limit lower="-10" upper="10"/>'
+                "</joint>"
+            )
+        urdf.append("</robot>\n")
+        self.urdf.write_text("\n".join(urdf), encoding="utf-8")
         self.repo_root = Path(__file__).resolve().parents[2]
         self.config = {
             "robot_name": "shadowhand",
@@ -118,6 +130,7 @@ class RunnerTests(unittest.TestCase):
         stages[:, 0, DRO_SHADOW_Q_NAMES.index("FFJ1")] = 0.2
         stages[:, 1, DRO_SHADOW_Q_NAMES.index("FFJ1")] = 0.4
         stages[:, 2, DRO_SHADOW_Q_NAMES.index("FFJ1")] = 0.6
+        stages[:, 1, DRO_SHADOW_Q_NAMES.index("THJ3")] = 0.5
         return {
             "initial_q": initial,
             "stage_q": stages,
@@ -178,6 +191,18 @@ class RunnerTests(unittest.TestCase):
         artifact = np.load(artifact_path, allow_pickle=True).item()
         self.assertEqual(artifact["robot_pose"].shape, (1, 20, 3, 29))
         self.assertTrue(np.isfinite(artifact["robot_pose"]).all())
+        raw_path = output_root / "raw" / "object_a" / "floating" / "scale013.npy"
+        raw = np.load(raw_path, allow_pickle=True).item()
+        thj3 = DRO_SHADOW_Q_NAMES.index("THJ3")
+        np.testing.assert_array_equal(raw["stage_q"][:, 1, thj3], 0.5)
+        self.assertTrue(np.all(raw["export_stage_q"][:, 1, thj3] <= 0.20944))
+        self.assertEqual(len(raw["export_clamp_diagnostics"]), 20)
+        self.assertTrue(
+            all(
+                item["bench_joint_name"] == "rh_THJ3"
+                for item in raw["export_clamp_diagnostics"]
+            )
+        )
         failure_manifest = json.loads((output_root / "failure_manifest.json").read_text())
         self.assertEqual(failure_manifest["failures"], [])
         validation = validate_run_outputs(output_root)

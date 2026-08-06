@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -453,6 +454,112 @@ def map_dro_shadow_fingers(q_euler: np.ndarray) -> tuple[np.ndarray, np.ndarray]
         lower, upper = BENCH_SHADOW_JOINT_LIMITS[name]
         excess[index] = max(lower - mapped[index], mapped[index] - upper, 0.0)
     return mapped, excess
+
+
+def load_dro_shadow_finger_joint_limits(
+    urdf_path: Path,
+) -> dict[str, tuple[float, float]]:
+    """Load the released DRO Shadow finger limits from its URDF."""
+
+    urdf_path = Path(urdf_path).resolve(strict=True)
+    try:
+        root = ET.parse(urdf_path).getroot()
+    except ET.ParseError as error:
+        raise ValueError(f"invalid Shadow URDF XML: {urdf_path}") from error
+
+    joint_elements = {
+        joint.get("name"): joint
+        for joint in root.findall("joint")
+        if joint.get("name") is not None
+    }
+    limits: dict[str, tuple[float, float]] = {}
+    for joint_name in DRO_SHADOW_FINGER_JOINT_NAMES:
+        joint = joint_elements.get(joint_name)
+        limit = joint.find("limit") if joint is not None else None
+        if limit is None:
+            raise ValueError(f"Shadow URDF joint has no limit: {joint_name}")
+        try:
+            lower = float(limit.attrib["lower"])
+            upper = float(limit.attrib["upper"])
+        except (KeyError, ValueError) as error:
+            raise ValueError(
+                f"Shadow URDF joint has invalid limits: {joint_name}"
+            ) from error
+        if not np.isfinite((lower, upper)).all() or lower > upper:
+            raise ValueError(f"Shadow URDF joint has invalid limits: {joint_name}")
+        limits[joint_name] = (lower, upper)
+    return limits
+
+
+def _representable_interval_bound(value: float, dtype: np.dtype, *, lower: bool):
+    """Return a floating-point bound rounded into the mathematical interval."""
+
+    cast = np.asarray(value, dtype=dtype)[()]
+    if lower and float(cast) < value:
+        cast = np.nextafter(cast, np.asarray(np.inf, dtype=dtype)[()])
+    elif not lower and float(cast) > value:
+        cast = np.nextafter(cast, np.asarray(-np.inf, dtype=dtype)[()])
+    return cast
+
+
+def clamp_dro_shadow_export_stages(
+    stage_q: np.ndarray,
+    dro_joint_limits: dict[str, tuple[float, float]],
+) -> tuple[np.ndarray, list[dict]]:
+    """Clamp only exported finger joints to the DRO/Bench limit intersection."""
+
+    q = np.asarray(stage_q)
+    if q.ndim != 3 or q.shape[1:] != (len(STAGE_NAMES), len(DRO_SHADOW_Q_NAMES)):
+        raise ValueError(
+            f"expected DRO stages [N,{len(STAGE_NAMES)},{len(DRO_SHADOW_Q_NAMES)}], "
+            f"got {q.shape}"
+        )
+    if not np.issubdtype(q.dtype, np.floating) or not np.isfinite(q).all():
+        raise ValueError("DRO stage q must contain finite floating-point values")
+
+    export_q = q.copy()
+    diagnostics = []
+    for bench_joint_name in BENCH_SHADOW_JOINT_NAMES:
+        dro_joint_name = BENCH_FROM_DRO[bench_joint_name]
+        if dro_joint_name not in dro_joint_limits:
+            raise ValueError(f"missing DRO joint limit: {dro_joint_name}")
+        dro_lower, dro_upper = dro_joint_limits[dro_joint_name]
+        bench_lower, bench_upper = BENCH_SHADOW_JOINT_LIMITS[bench_joint_name]
+        export_lower = max(float(dro_lower), bench_lower)
+        export_upper = min(float(dro_upper), bench_upper)
+        if (
+            not np.isfinite((export_lower, export_upper)).all()
+            or export_lower > export_upper
+        ):
+            raise ValueError(
+                f"DRO and Bench joint limits do not intersect: {dro_joint_name}"
+            )
+
+        dtype_lower = _representable_interval_bound(export_lower, q.dtype, lower=True)
+        dtype_upper = _representable_interval_bound(export_upper, q.dtype, lower=False)
+        q_index = DRO_SHADOW_Q_NAMES.index(dro_joint_name)
+        raw_values = q[:, :, q_index]
+        clamped_values = np.clip(raw_values, dtype_lower, dtype_upper)
+        export_q[:, :, q_index] = clamped_values
+        for candidate_index, stage_index in np.argwhere(raw_values != clamped_values):
+            raw_value = float(raw_values[candidate_index, stage_index])
+            clamped_value = float(clamped_values[candidate_index, stage_index])
+            diagnostics.append(
+                {
+                    "candidate_index": int(candidate_index),
+                    "stage_index": int(stage_index),
+                    "stage_name": STAGE_NAMES[stage_index],
+                    "dro_joint_name": dro_joint_name,
+                    "bench_joint_name": bench_joint_name,
+                    "raw_value": raw_value,
+                    "clamped_value": clamped_value,
+                    "delta": clamped_value - raw_value,
+                    "dro_limit": [float(dro_lower), float(dro_upper)],
+                    "bench_limit": [bench_lower, bench_upper],
+                    "export_limit": [export_lower, export_upper],
+                }
+            )
+    return export_q, diagnostics
 
 
 def dro_q_to_bench_pose(q_euler: np.ndarray, object_pose_wxyz: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
