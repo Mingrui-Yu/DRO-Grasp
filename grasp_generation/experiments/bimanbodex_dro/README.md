@@ -85,7 +85,7 @@ The checked-in `config.json` uses the read-only Heur-Fix reference root
 single_type_DGN2k_1000/graspdata`. It resolves 996 scenes (787 objects) across
 the complete scale range 0.02--0.30. The config pins the ordered
 scene/mesh/scale/pose provenance digest
-`9180845ed969e52be69cb31892536adafdfa725c6901a279d4dd793728037596`;
+`061d9305037b86bffed6732954a47126bbdb01ee476b12b9b8427600723a595e`;
 an incomplete or changed reference set is rejected before inference. A
 different approved scene revision must update the config and version evidence.
 

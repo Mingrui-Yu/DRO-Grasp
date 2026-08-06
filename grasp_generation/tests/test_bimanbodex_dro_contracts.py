@@ -45,7 +45,7 @@ class ContractTests(unittest.TestCase):
                     "type": "rigid_object",
                     "file_path": "../../../processed_data/object_a/mesh/simplified.obj",
                     "scale": np.array([0.133, 0.133, 0.133]),
-                    "pose": np.array([0.2, -0.1, 0.3, 1.0, 0.0, 0.0, 0.0]),
+                    "pose": np.array([0.2, -0.1, 0.3, 1.000001, 0.0, 0.0, 0.0]),
                 }
             },
         }
@@ -61,7 +61,9 @@ class ContractTests(unittest.TestCase):
         self.assertAlmostEqual(self.record.scale, 0.133)
         np.testing.assert_allclose(
             self.record.object_pose_wxyz,
-            [0.2, -0.1, 0.3, 1.0, 0.0, 0.0, 0.0],
+            [0.2, -0.1, 0.3, 1.000001, 0.0, 0.0, 0.0],
+            rtol=0.0,
+            atol=0.0,
         )
         self.assertTrue(self.record.stored_scene_path.endswith("object_a/floating/scale013.npy"))
 

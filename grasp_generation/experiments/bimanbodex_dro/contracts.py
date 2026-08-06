@@ -205,8 +205,6 @@ def load_scene_record(
     quaternion_norm = np.linalg.norm(pose[3:])
     if not np.isclose(quaternion_norm, 1.0, rtol=0.0, atol=1e-5):
         raise ValueError(f"object quaternion is not normalized: {scene_path}")
-    pose = pose.copy()
-    pose[3:] /= quaternion_norm
 
     return SceneRecord(
         scene_id=scene_id,
@@ -215,7 +213,7 @@ def load_scene_record(
         object_id=object_id,
         mesh_path=mesh_path,
         scale=float(scale[0]),
-        object_pose_wxyz=pose,
+        object_pose_wxyz=pose.copy(),
         scene_sha256=sha256_file(scene_path),
         mesh_sha256=sha256_file(mesh_path),
     )

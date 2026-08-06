@@ -6,7 +6,7 @@
   ],
   "scene_list": null,
   "expected_scene_count": 996,
-  "expected_scene_manifest_sha256": "9180845ed969e52be69cb31892536adafdfa725c6901a279d4dd793728037596",
+  "expected_scene_manifest_sha256": "061d9305037b86bffed6732954a47126bbdb01ee476b12b9b8427600723a595e",
   "expected_scale_range": [0.02, 0.30],
   "checkpoint": "ckpt/model/model_3robots.pth",
   "shadow_urdf": "data/data_urdf/robot/shadowhand/shadow_hand_right_extended.urdf",
