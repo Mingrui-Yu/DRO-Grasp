@@ -18,6 +18,10 @@ from grasp_generation.experiments.bimanbodex_dro.contracts import (
     DRO_SHADOW_Q_NAMES,
     dro_q_to_object_palm_transform,
 )
+from grasp_generation.experiments.bimanbodex_dro.initialization import (
+    apply_initialization,
+    resolve_initialization_config,
+)
 from grasp_generation.experiments.bimanbodex_dro.runner import run
 from grasp_generation.experiments.bimanbodex_dro.visualizer import (
     ShadowHandModel,
@@ -59,7 +63,14 @@ class VisualizerTests(unittest.TestCase):
                             "pose": np.array(
                                 [0.2, -0.1, 0.3, 1.0, 0.0, 0.0, 0.0]
                             ),
-                        }
+                        },
+                        "table": {
+                            "type": "plane",
+                            "pose": np.array(
+                                [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
+                            ),
+                            "size": np.array([0.0, 0.0, 1.0]),
+                        },
                     },
                 },
                 allow_pickle=True,
@@ -170,7 +181,21 @@ class VisualizerTests(unittest.TestCase):
     @staticmethod
     def _inference(record, points, candidate_seeds):
         count = len(candidate_seeds)
-        initial = np.zeros((count, len(DRO_SHADOW_Q_NAMES)), dtype=np.float32)
+        released = np.zeros((count, len(DRO_SHADOW_Q_NAMES)), dtype=np.float32)
+        initial = released.copy()
+        resolved_initialization = resolve_initialization_config(None, count)
+        metadata = []
+        rng_digests = []
+        for candidate_index, candidate_seed in enumerate(candidate_seeds):
+            initial[candidate_index], item = apply_initialization(
+                released[candidate_index],
+                record,
+                candidate_index,
+                resolved_initialization,
+            )
+            item["candidate_seed"] = candidate_seed
+            metadata.append(item)
+            rng_digests.append({"cpu": format(candidate_index + 1, "064x")})
         stages = np.zeros((count, 3, len(DRO_SHADOW_Q_NAMES)), dtype=np.float32)
         stages[:, :, DRO_SHADOW_Q_NAMES.index("virtual_joint_x")] = 0.05
         stages[:, :, DRO_SHADOW_Q_NAMES.index("WRJ2")] = 0.1
@@ -190,9 +215,12 @@ class VisualizerTests(unittest.TestCase):
                 }
             )
         return {
+            "released_initial_q": released,
             "initial_q": initial,
             "stage_q": stages,
             "timing_seconds": np.arange(count, dtype=np.float64) / 100.0,
+            "initialization_metadata": metadata,
+            "pre_network_rng_state_sha256": rng_digests,
             "failures": failures,
         }
 

@@ -15,6 +15,7 @@ if str(REPO_ROOT) not in sys.path:
 if str(GRASP_GENERATION_ROOT) not in sys.path:
     sys.path.insert(0, str(GRASP_GENERATION_ROOT))
 
+from experiments.bimanbodex_dro.initialization import INITIALIZATION_MODES
 from experiments.bimanbodex_dro.runner import dry_run, run
 
 
@@ -25,6 +26,7 @@ def main() -> None:
     parser.add_argument("--output-root", type=Path)
     parser.add_argument("--scene-list", type=Path)
     parser.add_argument("--max-scenes", type=int)
+    parser.add_argument("--initialization-mode", choices=INITIALIZATION_MODES)
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parents[2]
@@ -35,6 +37,8 @@ def main() -> None:
         config["scene_list"] = str(args.scene_list)
     if args.max_scenes is not None:
         config["max_scenes"] = args.max_scenes
+    if args.initialization_mode is not None:
+        config.setdefault("initialization", {})["mode"] = args.initialization_mode
 
     result = dry_run(repo_root, config) if args.dry_run else run(repo_root, config)
     print(json.dumps(result, indent=2, sort_keys=True, default=str))

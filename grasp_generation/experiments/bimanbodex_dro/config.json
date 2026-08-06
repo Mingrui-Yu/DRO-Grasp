@@ -6,7 +6,7 @@
   ],
   "scene_list": null,
   "expected_scene_count": 996,
-  "expected_scene_manifest_sha256": "061d9305037b86bffed6732954a47126bbdb01ee476b12b9b8427600723a595e",
+  "expected_scene_manifest_sha256": "1f6ef04c5e2234bd54edd6a0075883d6f16909af3b6e65a38ae8141934621030",
   "expected_scale_range": [0.02, 0.30],
   "checkpoint": "ckpt/model/model_3robots.pth",
   "shadow_urdf": "data/data_urdf/robot/shadowhand/shadow_hand_right_extended.urdf",
@@ -18,6 +18,39 @@
   "point_seed": 240824,
   "candidate_count": 20,
   "inference_seed": 240825,
+  "initialization": {
+    "mode": "released_random",
+    "palm_approach_axis_local": [0.0, 1.0, 0.0],
+    "palm_approach_axis_sign": "object_to_palm",
+    "candidate_ordering": [
+      {
+        "family": "top_down",
+        "count": 6,
+        "elevation_range_deg": [60.0, 90.0]
+      },
+      {
+        "family": "oblique",
+        "count": 8,
+        "elevation_range_deg": [20.0, 60.0]
+      },
+      {
+        "family": "near_horizontal",
+        "count": 6,
+        "elevation_range_deg": [0.0, 20.0]
+      }
+    ],
+    "elevation_stratification": "family_midpoints",
+    "azimuth": {
+      "range_deg": [0.0, 360.0],
+      "stratification": "family_midpoints"
+    },
+    "roll": {
+      "range_deg": [0.0, 360.0],
+      "stratification": "global_permuted_midpoints",
+      "stride": 7,
+      "offset": 0
+    }
+  },
   "n_iter": 64,
   "device": "cuda:0",
   "failure_policy": "scene_atomic_all_candidates_fail",

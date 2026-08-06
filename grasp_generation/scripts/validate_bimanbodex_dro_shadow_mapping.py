@@ -12,6 +12,7 @@ from typing import Optional
 
 import mujoco
 import numpy as np
+import yaml
 
 GRASP_GENERATION_ROOT = Path(__file__).resolve().parents[1]
 if str(GRASP_GENERATION_ROOT) not in sys.path:
@@ -21,10 +22,15 @@ from experiments.bimanbodex_dro.contracts import (  # noqa: E402
     BENCH_FROM_DRO,
     BENCH_SHADOW_JOINT_NAMES,
     DRO_SHADOW_Q_NAMES,
+    dro_q_to_bench_pose,
     dro_q_to_object_palm_transform,
     map_dro_shadow_fingers,
+    pose_wxyz_to_matrix,
 )
-
+from experiments.bimanbodex_dro.initialization import (  # noqa: E402
+    PALM_APPROACH_AXIS_LOCAL,
+    PALM_APPROACH_AXIS_SIGN,
+)
 
 LINK_PAIRS = {
     "ffknuckle": "rh_ffknuckle",
@@ -163,7 +169,13 @@ def _rotation_error(left: np.ndarray, right: np.ndarray) -> float:
     return float(np.arccos(cosine))
 
 
-def validate(urdf_path: Path, bench_mjcf: Path, samples: int, seed: int) -> dict:
+def validate(
+    urdf_path: Path,
+    bench_mjcf: Path,
+    bench_hand_config: Path,
+    samples: int,
+    seed: int,
+) -> dict:
     by_parent, urdf_limits = load_urdf(urdf_path)
     if tuple(urdf_limits) != DRO_SHADOW_Q_NAMES:
         raise ValueError(f"DRO q order mismatch: {tuple(urdf_limits)}")
@@ -177,6 +189,16 @@ def validate(urdf_path: Path, bench_mjcf: Path, samples: int, seed: int) -> dict
     expected_bench_set = set(BENCH_SHADOW_JOINT_NAMES)
     if set(bench_names) != expected_bench_set or model.nq != len(BENCH_SHADOW_JOINT_NAMES):
         raise ValueError(f"Bench joint set mismatch: {bench_names}")
+    hand_config = yaml.safe_load(Path(bench_hand_config).read_text(encoding="utf-8"))
+    approach_axes = hand_config.get("wrist_approach_axes") if isinstance(hand_config, dict) else None
+    if approach_axes != [[0, 1, 0]]:
+        raise ValueError(
+            f"Bench Shadow wrist_approach_axes must be [[0, 1, 0]], got {approach_axes}"
+        )
+    bench_approach_axis_local = np.asarray(approach_axes[0], dtype=np.float64)
+    bench_approach_axis_local /= np.linalg.norm(bench_approach_axis_local)
+    if not np.array_equal(bench_approach_axis_local, PALM_APPROACH_AXIS_LOCAL):
+        raise ValueError("DRO and Bench palm-local approach axes disagree")
 
     rng = np.random.default_rng(seed)
     zero_q = {name: 0.0 for name in DRO_SHADOW_Q_NAMES}
@@ -206,6 +228,8 @@ def validate(urdf_path: Path, bench_mjcf: Path, samples: int, seed: int) -> dict
     max_link_position_error = 0.0
     max_link_rotation_error = 0.0
     max_joint_range_excess = 0.0
+    max_palm_approach_axis_fk_error = 0.0
+    max_exported_approach_axis_error = 0.0
     worst_link = None
 
     for _ in range(samples):
@@ -225,6 +249,23 @@ def validate(urdf_path: Path, bench_mjcf: Path, samples: int, seed: int) -> dict
         )
         max_root_rotation_error = max(
             max_root_rotation_error, _rotation_error(contract_palm, urdf_palm)
+        )
+        contract_axis = contract_palm[:3, :3] @ PALM_APPROACH_AXIS_LOCAL
+        urdf_axis = urdf_palm[:3, :3] @ PALM_APPROACH_AXIS_LOCAL
+        max_palm_approach_axis_fk_error = max(
+            max_palm_approach_axis_fk_error,
+            float(np.linalg.norm(contract_axis - urdf_axis)),
+        )
+        bench_pose, _ = dro_q_to_bench_pose(
+            q, np.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
+        )
+        exported_axis = (
+            pose_wxyz_to_matrix(bench_pose[:7])[:3, :3]
+            @ bench_approach_axis_local
+        )
+        max_exported_approach_axis_error = max(
+            max_exported_approach_axis_error,
+            float(np.linalg.norm(contract_axis - exported_axis)),
         )
 
         mapped, excess = map_dro_shadow_fingers(q)
@@ -270,6 +311,10 @@ def validate(urdf_path: Path, bench_mjcf: Path, samples: int, seed: int) -> dict
         "max_link_rotation_error_rad": max_link_rotation_error,
         "max_fixed_link_frame_offset_rad": max_fixed_frame_offset,
         "max_joint_range_excess_rad": max_joint_range_excess,
+        "palm_approach_axis_local": PALM_APPROACH_AXIS_LOCAL.tolist(),
+        "palm_approach_axis_sign": PALM_APPROACH_AXIS_SIGN,
+        "max_palm_approach_axis_fk_error": max_palm_approach_axis_fk_error,
+        "max_exported_approach_axis_error": max_exported_approach_axis_error,
         "worst_link": worst_link,
     }
 
@@ -278,12 +323,19 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dro-urdf", type=Path, required=True)
     parser.add_argument("--bench-mjcf", type=Path, required=True)
+    parser.add_argument("--bench-hand-config", type=Path, required=True)
     parser.add_argument("--samples", type=int, default=128)
     parser.add_argument("--seed", type=int, default=240826)
     parser.add_argument("--max-position-error", type=float, default=0.002)
     parser.add_argument("--max-rotation-error", type=float, default=0.003)
     args = parser.parse_args()
-    result = validate(args.dro_urdf, args.bench_mjcf, args.samples, args.seed)
+    result = validate(
+        args.dro_urdf,
+        args.bench_mjcf,
+        args.bench_hand_config,
+        args.samples,
+        args.seed,
+    )
     print(json.dumps(result, indent=2, sort_keys=True))
     if result["max_root_position_error_m"] > 1e-9:
         raise SystemExit("DRO root-to-palm contract does not match the release URDF")
@@ -295,6 +347,10 @@ def main() -> None:
         raise SystemExit("DRO/Bench link rotation mismatch exceeds tolerance")
     if result["max_joint_range_excess_rad"] > 1e-6:
         raise SystemExit("DRO mapping exceeds Bench joint limits")
+    if result["max_palm_approach_axis_fk_error"] > 1e-7:
+        raise SystemExit("DRO palm approach axis does not match release URDF FK")
+    if result["max_exported_approach_axis_error"] > 1e-7:
+        raise SystemExit("exported Bench approach axis does not match DRO palm +Y")
 
 
 if __name__ == "__main__":

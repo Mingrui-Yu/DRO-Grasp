@@ -2,8 +2,10 @@
 
 This experiment adapter runs the released complete-point-cloud DRO-Grasp model
 on the same ShadowHand DGN2k scene contract used by the project baselines. It
-does not train or modify the network, add table-aware proposals, or invoke the
-official Isaac Gym evaluator.
+does not train or modify the network or invoke the official Isaac Gym evaluator.
+It supports a strict initialization ablation between the released random root
+orientation and deterministic tabletop-oriented proposals; neither mode adds a
+table collision loss, rejection step, or execution-path check.
 
 ## Fixed contracts
 
@@ -19,6 +21,22 @@ official Isaac Gym evaluator.
 - Scene export: `T_WH = T_WO @ T_OPalm`. `T_OPalm` includes the released
   floating forearm pose plus `WRJ2/WRJ1`; these wrist joints are not silently
   dropped into the Bench finger vector.
+- Scene input must explicitly contain the `table` plane. Its pose and local
+  normal are resolved in world coordinates and persisted in v2 scene
+  provenance; the adapter never infers a table from object bounds or names.
+- Initialization modes:
+  - `released_random` retains `HandModel.get_initial_q()` exactly.
+  - `tabletop_stratified` first calls that same released sampler, then replaces
+    only `q[3:6]`. The default ordered allocation is 6 `top_down` proposals at
+    60--90 degrees, 8 `oblique` proposals at 20--60 degrees, and 6
+    `near_horizontal` proposals at 0--20 degrees. Elevation is measured from
+    the table plane; elevation, azimuth, and roll use deterministic midpoint
+    strata recorded in the resolved config.
+- The numerically validated DRO/Bench palm-local approach axis is `+Y` with
+  `object_to_palm` sign semantics. This is a palm-side direction, not the
+  execution velocity. Tabletop directions are built in world coordinates,
+  transformed by `R_WO^T`, and applied to the actual palm after compensating
+  the unchanged `WRJ2`/`WRJ1` wrist rotation.
 - Hand mapping: the released URDF and Bench MJCF share right-hand finger joint
   semantics. Export adds the `rh_` namespace and reorders by name. The official
   raw controller stages are retained unchanged; an export-only copy clamps
@@ -28,7 +46,10 @@ official Isaac Gym evaluator.
 - Stages: the official `controller()` output is exported as
   `q_outer -> pregrasp`, optimized `q -> grasp`, and `q_inner -> squeeze`.
 - Budget: exactly 20 raw candidates per scene. Candidate seeds and ordering are
-  stable and recorded.
+  stable and recorded. Both modes consume the released sampler before any
+  override, so root translation and `q[6:]` match for each paired candidate.
+  The CPU and applicable CUDA Torch RNG-state digests are captured immediately
+  before network forward to verify identical validation latent state.
 - Failure policy: outputs are scene-atomic. If any candidate fails inference or
   export validation, no normal Bench artifact is written for that scene and all
   20 candidates are conservatively counted as failed. Partial raw diagnostics
@@ -51,6 +72,10 @@ Each successful raw artifact stores `stage_q` as the untouched official
 `q_outer/q/q_inner` result and `export_stage_q` as the Bench-facing clamped
 copy. `export_clamp_diagnostics` records the candidate, stage, joint, raw and
 clamped values, delta, and both source limit intervals for every clamp.
+New runs use `drograsp.dgn2k.raw.v2` / `drograsp.dgn2k.run.v2` and additionally
+store `released_initial_q`, effective `initial_q`, initialization metadata, the
+explicit table contract, and pre-network RNG digests. Validators and the viewer
+retain read-only support for #24 v1 artifacts; new writes are always v2.
 
 ## Assets and environment
 
@@ -85,6 +110,7 @@ Shadow mapping against the unchanged Bench asset:
 python grasp_generation/scripts/validate_bimanbodex_dro_shadow_mapping.py \
   --dro-urdf data/data_urdf/robot/shadowhand/shadow_hand_right_extended.urdf \
   --bench-mjcf ../BimanDexGraspBench/assets/hand/shadow/right_hand_v2.xml \
+  --bench-hand-config ../BimanDexGraspBench/config/hand/shadow.yaml \
   --samples 128
 ```
 
@@ -92,8 +118,8 @@ The checked-in `config.json` uses the read-only Heur-Fix reference root
 `../BimanBODex/src/curobo/content/assets/output/sim_shadow/tabletop_full/
 single_type_DGN2k_1000/graspdata`. It resolves 996 scenes (787 objects) across
 the complete scale range 0.02--0.30. The config pins the ordered
-scene/mesh/scale/pose provenance digest
-`061d9305037b86bffed6732954a47126bbdb01ee476b12b9b8427600723a595e`;
+scene/mesh/scale/pose/table provenance digest
+`1f6ef04c5e2234bd54edd6a0075883d6f16909af3b6e65a38ae8141934621030`;
 an incomplete or changed reference set is rejected before inference. A
 different approved scene revision must update the config and version evidence.
 
@@ -104,16 +130,19 @@ directory:
 ```bash
 python grasp_generation/scripts/generate_bimanbodex_dro.py \
   --config grasp_generation/experiments/bimanbodex_dro/config.json \
+  --initialization-mode tabletop_stratified \
   --dry-run
 ```
 
 After GPU authorization, use a new output root:
 
 ```bash
-conda run -n dro python grasp_generation/scripts/generate_bimanbodex_dro.py \
+DRO_PYTHON="${DRO_PYTHON:-../.conda-envs/dro/bin/python}"
+"$DRO_PYTHON" grasp_generation/scripts/generate_bimanbodex_dro.py \
   --config grasp_generation/experiments/bimanbodex_dro/config.json \
+  --initialization-mode tabletop_stratified \
   --max-scenes 1 \
-  --output-root /path/to/new/dro-model_3robots-seed240825
+  --output-root /path/to/new/issue31-tabletop_stratified-model_3robots-seed240825
 ```
 
 The one-scene command is only the bounded GPU smoke. Remove `--max-scenes 1`
@@ -124,6 +153,18 @@ Revalidate the persisted raw/artifact contract independently:
 ```bash
 python grasp_generation/scripts/validate_bimanbodex_dro_outputs.py \
   /path/to/new/dro-model_3robots-seed240825
+```
+
+For the formal ablation, run both modes from the same source/config into two new
+output roots, then validate the pair. The paired validator requires identical
+scenes, point clouds, candidate seeds, released q, root translations, wrist and
+finger q, and pre-network RNG digests; all 20 effective root rotations must be
+replaced only in the tabletop run:
+
+```bash
+python grasp_generation/scripts/validate_bimanbodex_dro_pair.py \
+  --released-root /path/to/new/issue31-released_random-model_3robots-seed240825 \
+  --tabletop-root /path/to/new/issue31-tabletop_stratified-model_3robots-seed240825
 ```
 
 ## Exported three-pose Viser viewer
@@ -191,11 +232,12 @@ All geometry is constructed on CPU in the saved world frame using
 `T_WH = T_WO @ T_OPalm`. The complete released Shadow URDF includes the floating
 root, `WRJ2`/`WRJ1`, and all 22 finger joints. The object mesh is loaded from the
 same `processed_data/<object_id>/mesh/simplified.obj`, scaled and posed exactly;
-it is not recentered, normalized, or resampled. This viewer is not table-aware:
-the absence of a visible collision must not be interpreted as tabletop success
-or collision-free generation.
+it is not recentered, normalized, or resampled. The viewer does not render or
+evaluate table contact: the absence of a visible collision must not be
+interpreted as tabletop success or collision-free generation.
 
-The current Bench tabletop protocol is the only evaluation target. Because DRO
-does not receive the table and this adapter adds no table-collision objective or
-post-filter, results may only be described as performance under that protocol,
-not as native table-aware or collision-free generation.
+The current Bench tabletop protocol is the only evaluation target. The network
+still does not receive table points and the adapter adds no table-collision
+objective or post-filter. Results may only be described as the effect of
+tabletop-oriented/table-conditioned initialization under that protocol, not as
+native table-collision-aware or collision-free generation.
