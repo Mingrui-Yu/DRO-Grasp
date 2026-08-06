@@ -11,7 +11,7 @@ import torch
 
 from grasp_generation.experiments.bimanbodex_dro.contracts import (
     DRO_SHADOW_Q_NAMES,
-    dro_q_to_object_palm_transform,
+    legacy_dro_q_to_object_palm_transform,
     quaternion_wxyz_to_matrix,
 )
 from grasp_generation.experiments.bimanbodex_dro.initialization import (
@@ -87,7 +87,7 @@ class InitializationTests(unittest.TestCase):
             self.assertEqual(metadata["proposal_family"], proposal["family"])
             self.assertGreaterEqual(metadata["upper_hemisphere_dot"], 0.0)
             self.assertLess(metadata["target_alignment_error_rad"], 1e-5)
-            palm_object = dro_q_to_object_palm_transform(effective)[:3, :3]
+            palm_object = legacy_dro_q_to_object_palm_transform(effective)[:3, :3]
             direction_world = (
                 object_rotation_world @ palm_object @ PALM_APPROACH_AXIS_LOCAL
             )

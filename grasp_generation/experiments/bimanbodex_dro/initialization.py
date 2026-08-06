@@ -11,8 +11,8 @@ from scipy.spatial.transform import Rotation
 
 from .contracts import (
     DRO_SHADOW_Q_NAMES,
-    dro_q_to_object_palm_transform,
     euler_xyz_to_matrix,
+    legacy_dro_q_to_object_palm_transform,
     quaternion_wxyz_to_matrix,
     sha256_array,
 )
@@ -318,7 +318,9 @@ def apply_initialization(
         effective[3:6] = Rotation.from_matrix(target_root_object).as_euler("XYZ")
 
     object_rotation_world = quaternion_wxyz_to_matrix(record.object_pose_wxyz[3:])
-    palm_rotation_object = dro_q_to_object_palm_transform(effective)[:3, :3]
+    # Keep the pre-Issue-37 initialization calculation unchanged. Production
+    # palm-root export independently uses the actual pytorch-kinematics chain.
+    palm_rotation_object = legacy_dro_q_to_object_palm_transform(effective)[:3, :3]
     actual_direction_world = (
         object_rotation_world @ palm_rotation_object @ PALM_APPROACH_AXIS_LOCAL
     )

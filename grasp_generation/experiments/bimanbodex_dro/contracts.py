@@ -49,6 +49,30 @@ BENCH_FROM_DRO = {
     bench_name: bench_name[3:]
     for bench_name in BENCH_SHADOW_JOINT_NAMES
 }
+DRO_BENCH_LINK_PAIRS = {
+    "ffknuckle": "rh_ffknuckle",
+    "ffproximal": "rh_ffproximal",
+    "ffmiddle": "rh_ffmiddle",
+    "ffdistal": "rh_ffdistal",
+    "mfknuckle": "rh_mfknuckle",
+    "mfproximal": "rh_mfproximal",
+    "mfmiddle": "rh_mfmiddle",
+    "mfdistal": "rh_mfdistal",
+    "rfknuckle": "rh_rfknuckle",
+    "rfproximal": "rh_rfproximal",
+    "rfmiddle": "rh_rfmiddle",
+    "rfdistal": "rh_rfdistal",
+    "lfmetacarpal": "rh_lfmetacarpal",
+    "lfknuckle": "rh_lfknuckle",
+    "lfproximal": "rh_lfproximal",
+    "lfmiddle": "rh_lfmiddle",
+    "lfdistal": "rh_lfdistal",
+    "thbase": "rh_thbase",
+    "thproximal": "rh_thproximal",
+    "thhub": "rh_thhub",
+    "thmiddle": "rh_thmiddle",
+    "thdistal": "rh_thdistal",
+}
 BENCH_SHADOW_JOINT_LIMITS = {
     "rh_THJ5": (-1.0472, 1.0472),
     "rh_THJ4": (0.0, 1.22173),
@@ -467,8 +491,13 @@ def matrix_to_pose_wxyz(transform: np.ndarray) -> np.ndarray:
     return np.concatenate((value[:3, 3], matrix_to_quaternion_wxyz(value[:3, :3])))
 
 
-def dro_q_to_object_palm_transform(q_euler: np.ndarray) -> np.ndarray:
-    """Resolve the released floating forearm and wrist chain to DRO's palm frame."""
+def legacy_dro_q_to_object_palm_transform(q_euler: np.ndarray) -> np.ndarray:
+    """Reproduce the pre-Issue-37 hand-written palm transform.
+
+    This function exists only for validating historical artifacts. New exports
+    must use :func:`dro_stage_q_to_object_palm_transforms` with the actual DRO
+    pytorch-kinematics chain.
+    """
 
     q = np.asarray(q_euler, dtype=np.float64).reshape(-1)
     if q.shape != (len(DRO_SHADOW_Q_NAMES),) or not np.isfinite(q).all():
@@ -486,6 +515,115 @@ def dro_q_to_object_palm_transform(q_euler: np.ndarray) -> np.ndarray:
     palm_rotation = np.eye(4, dtype=np.float64)
     palm_rotation[:3, :3] = _rotation_x(q[7])
     return transform @ wrist_origin @ wrist_rotation @ palm_origin @ palm_rotation
+
+
+def legacy_dro_stage_q_to_object_palm_transforms(stage_q: np.ndarray) -> np.ndarray:
+    """Return historical hand-written palm transforms for persisted compatibility."""
+
+    q = np.asarray(stage_q, dtype=np.float64)
+    if q.ndim != 3 or q.shape[1:] != (len(STAGE_NAMES), len(DRO_SHADOW_Q_NAMES)):
+        raise ValueError(
+            f"expected DRO stages [N,{len(STAGE_NAMES)},{len(DRO_SHADOW_Q_NAMES)}], "
+            f"got {q.shape}"
+        )
+    if not np.isfinite(q).all():
+        raise ValueError("DRO stage q contains non-finite values")
+    transforms = np.empty(q.shape[:-1] + (4, 4), dtype=np.float64)
+    for candidate_index in range(q.shape[0]):
+        for stage_index in range(q.shape[1]):
+            transforms[candidate_index, stage_index] = (
+                legacy_dro_q_to_object_palm_transform(
+                    q[candidate_index, stage_index]
+                )
+            )
+    return transforms
+
+
+def build_dro_shadow_pk_chain(urdf_path: Path, *, device="cpu"):
+    """Build and validate the actual DRO Shadow pytorch-kinematics chain."""
+
+    try:
+        import pytorch_kinematics as pk
+        import torch
+    except ImportError as error:
+        raise RuntimeError(
+            "pytorch-kinematics and torch are required for DRO palm-root export"
+        ) from error
+
+    urdf_path = Path(urdf_path).resolve(strict=True)
+    chain = pk.build_chain_from_urdf(urdf_path.read_text(encoding="utf-8")).to(
+        dtype=torch.float32,
+        device=device,
+    )
+    joint_names = tuple(chain.get_joint_parameter_names())
+    if joint_names != DRO_SHADOW_Q_NAMES:
+        raise ValueError(
+            "released Shadow URDF q order does not match the export contract: "
+            f"{joint_names}"
+        )
+    if "palm" not in chain.get_link_names():
+        raise ValueError("released Shadow URDF has no palm link")
+    return chain
+
+
+def dro_stage_q_to_object_palm_transforms(pk_chain, stage_q: np.ndarray) -> np.ndarray:
+    """Evaluate the actual DRO FK palm transform for every candidate and stage."""
+
+    try:
+        import torch
+    except ImportError as error:
+        raise RuntimeError("torch is required for DRO palm-root export") from error
+
+    q = np.asarray(stage_q)
+    if q.ndim != 3 or q.shape[1:] != (len(STAGE_NAMES), len(DRO_SHADOW_Q_NAMES)):
+        raise ValueError(
+            f"expected DRO stages [N,{len(STAGE_NAMES)},{len(DRO_SHADOW_Q_NAMES)}], "
+            f"got {q.shape}"
+        )
+    if not np.issubdtype(q.dtype, np.floating) or not np.isfinite(q).all():
+        raise ValueError("DRO stage q must contain finite floating-point values")
+    joint_names = tuple(pk_chain.get_joint_parameter_names())
+    if joint_names != DRO_SHADOW_Q_NAMES:
+        raise ValueError(
+            "DRO PK chain q order does not match the export contract: "
+            f"{joint_names}"
+        )
+    if "palm" not in pk_chain.get_link_names():
+        raise ValueError("DRO PK chain has no palm link")
+
+    flat_q = q.reshape(-1, q.shape[-1])
+    tensor_q = torch.as_tensor(
+        flat_q,
+        dtype=pk_chain.dtype,
+        device=pk_chain.device,
+    )
+    with torch.no_grad():
+        palm = pk_chain.forward_kinematics(tensor_q)["palm"].get_matrix()
+    transforms = palm.detach().cpu().numpy().reshape(q.shape[:-1] + (4, 4))
+    if not np.isfinite(transforms).all():
+        raise ValueError("DRO PK palm FK contains non-finite values")
+    return transforms.astype(np.float64)
+
+
+def _validated_palm_object_transforms(
+    palm_object_transforms: np.ndarray,
+    q_shape: tuple,
+) -> np.ndarray:
+    transforms = np.asarray(palm_object_transforms, dtype=np.float64)
+    expected_shape = q_shape[:-1] + (4, 4)
+    if transforms.shape != expected_shape or not np.isfinite(transforms).all():
+        raise ValueError(
+            f"palm_object_transforms must be finite {expected_shape}, "
+            f"got {transforms.shape}"
+        )
+    bottom = transforms[..., 3, :]
+    expected_bottom = np.broadcast_to(
+        np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64),
+        bottom.shape,
+    )
+    if not np.allclose(bottom, expected_bottom, rtol=0.0, atol=1e-7):
+        raise ValueError("palm_object_transforms are not homogeneous transforms")
+    return transforms
 
 
 def map_dro_shadow_fingers(q_euler: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -612,11 +750,18 @@ def clamp_dro_shadow_export_stages(
     return export_q, diagnostics
 
 
-def dro_q_to_bench_pose(q_euler: np.ndarray, object_pose_wxyz: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def dro_q_to_bench_pose(
+    q_euler: np.ndarray,
+    object_pose_wxyz: np.ndarray,
+    *,
+    palm_object_transform: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
     """Export one DRO q through ``T_WH = T_WO @ T_OPalm`` into Bench form."""
 
     object_world = pose_wxyz_to_matrix(object_pose_wxyz)
-    palm_object = dro_q_to_object_palm_transform(q_euler)
+    palm_object = np.asarray(palm_object_transform, dtype=np.float64).reshape(4, 4)
+    if not np.isfinite(palm_object).all():
+        raise ValueError("palm_object_transform contains non-finite values")
     palm_world = matrix_to_pose_wxyz(object_world @ palm_object)
     joints, limit_excess = map_dro_shadow_fingers(q_euler)
     return np.concatenate((palm_world, joints)), limit_excess
@@ -626,6 +771,8 @@ def make_bench_artifact(
     stage_q: np.ndarray,
     object_pose_wxyz: np.ndarray,
     scene_path: str,
+    *,
+    palm_object_transforms: np.ndarray,
 ) -> tuple[dict, np.ndarray]:
     """Convert official ``q_outer/q/q_inner`` stages into the unchanged Bench schema."""
 
@@ -638,12 +785,20 @@ def make_bench_artifact(
         raise ValueError("scene_path must be a non-empty string")
 
     object_pose = np.asarray(object_pose_wxyz, dtype=np.float64).reshape(7)
+    palm_transforms = _validated_palm_object_transforms(
+        palm_object_transforms,
+        q.shape,
+    )
 
     candidates = np.empty((q.shape[0], 3, 7 + len(BENCH_SHADOW_JOINT_NAMES)), dtype=np.float32)
     limit_excess = np.empty((q.shape[0], 3, len(BENCH_SHADOW_JOINT_NAMES)), dtype=np.float32)
     for candidate_index in range(q.shape[0]):
         for stage_index in range(3):
-            pose, excess = dro_q_to_bench_pose(q[candidate_index, stage_index], object_pose)
+            pose, excess = dro_q_to_bench_pose(
+                q[candidate_index, stage_index],
+                object_pose,
+                palm_object_transform=palm_transforms[candidate_index, stage_index],
+            )
             candidates[candidate_index, stage_index] = pose.astype(np.float32)
             limit_excess[candidate_index, stage_index] = excess.astype(np.float32)
     artifact = {
@@ -659,6 +814,7 @@ def validate_artifact(
     record: SceneRecord,
     stage_q: np.ndarray,
     *,
+    palm_object_transforms: np.ndarray,
     joint_limit_tolerance: float = 1e-6,
     palm_tolerance: float = 1e-5,
 ) -> None:
@@ -676,7 +832,12 @@ def validate_artifact(
     if not np.isfinite(robot_pose).all():
         raise ValueError("artifact robot_pose contains non-finite values")
 
-    expected, excess = make_bench_artifact(q, record.object_pose_wxyz, record.stored_scene_path)
+    expected, excess = make_bench_artifact(
+        q,
+        record.object_pose_wxyz,
+        record.stored_scene_path,
+        palm_object_transforms=palm_object_transforms,
+    )
     if not np.allclose(robot_pose, expected["robot_pose"], rtol=0.0, atol=1e-6):
         raise ValueError("artifact does not match DRO-to-Bench conversion")
     if float(np.max(excess, initial=0.0)) > joint_limit_tolerance:
