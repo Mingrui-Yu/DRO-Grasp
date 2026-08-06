@@ -23,8 +23,11 @@ from .contracts import (
     RUN_SCHEMA_VERSION,
     STAGE_NAMES,
     SUPPORTED_RUN_SCHEMA_VERSIONS,
+    build_dro_shadow_pk_chain,
     clamp_dro_shadow_export_stages,
     discover_scene_paths,
+    dro_stage_q_to_object_palm_transforms,
+    legacy_dro_stage_q_to_object_palm_transforms,
     load_dro_shadow_finger_joint_limits,
     load_scene_record,
     make_bench_artifact,
@@ -64,6 +67,53 @@ def git_state(repo_root: Path) -> dict:
         "dirty": bool(status),
         "dirty_paths": status.splitlines(),
     }
+
+
+def _resolve_palm_fk_chain(inference, shadow_urdf: Path):
+    """Use the official inference chain when available, otherwise build it on CPU."""
+
+    hand = getattr(inference, "hand", None)
+    chain = getattr(hand, "pk_chain", None)
+    if chain is None:
+        chain = build_dro_shadow_pk_chain(shadow_urdf, device="cpu")
+    if tuple(chain.get_joint_parameter_names()) != DRO_SHADOW_Q_NAMES:
+        raise ValueError("DRO palm FK chain q order does not match the adapter contract")
+    if "palm" not in chain.get_link_names():
+        raise ValueError("DRO palm FK chain has no palm link")
+    return chain
+
+
+def _palm_fk_manifest(shadow_urdf: Path, chain) -> dict:
+    """Return stable provenance for the production palm-root FK backend."""
+
+    return {
+        "backend": "pytorch_kinematics",
+        "link_name": "palm",
+        "joint_names": list(DRO_SHADOW_Q_NAMES),
+        "urdf_sha256": sha256_file(shadow_urdf),
+        "dtype": str(chain.dtype),
+        "device": str(chain.device),
+    }
+
+
+def _validate_palm_fk_manifest(value, shadow_urdf: Path) -> dict:
+    """Validate new-export FK provenance while allowing legacy artifacts to opt out."""
+
+    if not isinstance(value, dict):
+        raise ValueError("palm_fk metadata must be an object")
+    if value.get("backend") != "pytorch_kinematics":
+        raise ValueError("palm_fk backend must be pytorch_kinematics")
+    if value.get("link_name") != "palm":
+        raise ValueError("palm_fk link_name must be palm")
+    if value.get("joint_names") != list(DRO_SHADOW_Q_NAMES):
+        raise ValueError("palm_fk joint order does not match DRO Shadow q")
+    if value.get("urdf_sha256") != sha256_file(shadow_urdf):
+        raise ValueError("palm_fk URDF hash does not match the resolved Shadow URDF")
+    if not isinstance(value.get("dtype"), str) or not value["dtype"]:
+        raise ValueError("palm_fk dtype is missing")
+    if not isinstance(value.get("device"), str) or not value["device"]:
+        raise ValueError("palm_fk device is missing")
+    return value
 
 
 def _atomic_json(path: Path, value: dict) -> None:
@@ -587,6 +637,9 @@ def run(repo_root: Path, config: dict, inference=None) -> dict:
         # Initialize before creating an output directory so a missing CUDA/runtime
         # dependency cannot leave a misleading partial run behind.
         inference = OfficialDROInference(repo_root, resolved)
+    shadow_urdf = Path(resolved["shadow_urdf"])
+    palm_fk_chain = _resolve_palm_fk_chain(inference, shadow_urdf)
+    palm_fk = _palm_fk_manifest(shadow_urdf, palm_fk_chain)
     output_root.mkdir(parents=True)
 
     manifest = {
@@ -599,6 +652,7 @@ def run(repo_root: Path, config: dict, inference=None) -> dict:
         "checkpoint_sha256": sha256_file(Path(resolved["checkpoint"])),
         "shadow_urdf_sha256": sha256_file(Path(resolved["shadow_urdf"])),
         "shadow_point_cloud_sha256": sha256_file(Path(resolved["shadow_point_cloud"])),
+        "palm_fk": palm_fk,
         "resolved_config": resolved,
         "initialization_mode": resolved["initialization"]["mode"],
         "scene_count": len(records),
@@ -699,6 +753,7 @@ def run(repo_root: Path, config: dict, inference=None) -> dict:
                 "initialization_metadata": initialization_metadata,
                 "pre_network_rng_state_sha256": pre_network_rng_state_sha256,
                 "stage_q": stage_q,
+                "palm_fk": palm_fk,
                 "timing_seconds": timings,
                 "failed_candidate_indices": failure_indices,
             }
@@ -719,12 +774,22 @@ def run(repo_root: Path, config: dict, inference=None) -> dict:
                     )
                     raw["export_stage_q"] = export_stage_q
                     raw["export_clamp_diagnostics"] = clamp_diagnostics
+                    palm_object_transforms = dro_stage_q_to_object_palm_transforms(
+                        palm_fk_chain,
+                        export_stage_q,
+                    )
                     artifact, limit_excess = make_bench_artifact(
                         export_stage_q,
                         record.object_pose_wxyz,
                         record.stored_scene_path,
+                        palm_object_transforms=palm_object_transforms,
                     )
-                    validate_artifact(artifact, record, export_stage_q)
+                    validate_artifact(
+                        artifact,
+                        record,
+                        export_stage_q,
+                        palm_object_transforms=palm_object_transforms,
+                    )
                     raw["bench_joint_limit_excess"] = limit_excess
                     raw["export_seconds"] = time.perf_counter() - export_started
                     _write_scene_pair(grasp_path, raw_path, artifact, raw)
@@ -913,6 +978,13 @@ def validate_run_outputs(output_root: Path) -> dict:
     shadow_finger_joint_limits = load_dro_shadow_finger_joint_limits(
         Path(resolved["shadow_urdf"])
     )
+    shadow_urdf = Path(resolved["shadow_urdf"])
+    persisted_palm_fk = manifest.get("palm_fk")
+    if persisted_palm_fk is None:
+        palm_fk_chain = None
+    else:
+        _validate_palm_fk_manifest(persisted_palm_fk, shadow_urdf)
+        palm_fk_chain = build_dro_shadow_pk_chain(shadow_urdf, device="cpu")
     source_records, selected_records = resolve_scene_records(
         resolved,
         include_table_in_manifest=(run_schema_version != LEGACY_RUN_SCHEMA_VERSION),
@@ -956,6 +1028,8 @@ def validate_run_outputs(output_root: Path) -> dict:
                 raise ValueError(f"stage order mismatch for {record.scene_id}")
             if raw.get("dro_q_names") != list(DRO_SHADOW_Q_NAMES):
                 raise ValueError(f"DRO q order mismatch for {record.scene_id}")
+            if persisted_palm_fk is not None and raw.get("palm_fk") != persisted_palm_fk:
+                raise ValueError(f"palm FK provenance mismatch for {record.scene_id}")
             points = np.asarray(raw.get("object_point_cloud"))
             if points.shape != (512, 3) or points.dtype != np.float32:
                 raise ValueError(f"point-cloud contract mismatch for {record.scene_id}")
@@ -999,10 +1073,19 @@ def validate_run_outputs(output_root: Path) -> dict:
             export_seconds = raw.get("export_seconds")
             if not isinstance(export_seconds, float) or export_seconds < 0.0:
                 raise ValueError(f"export timing contract mismatch for {record.scene_id}")
+            palm_object_transforms = (
+                legacy_dro_stage_q_to_object_palm_transforms(export_stage_q)
+                if palm_fk_chain is None
+                else dro_stage_q_to_object_palm_transforms(
+                    palm_fk_chain,
+                    export_stage_q,
+                )
+            )
             expected_artifact, expected_excess = make_bench_artifact(
                 export_stage_q,
                 record.object_pose_wxyz,
                 record.stored_scene_path,
+                palm_object_transforms=palm_object_transforms,
             )
             persisted_excess = np.asarray(raw.get("bench_joint_limit_excess"))
             if persisted_excess.shape != expected_excess.shape or not np.array_equal(
@@ -1011,7 +1094,12 @@ def validate_run_outputs(output_root: Path) -> dict:
                 raise ValueError(f"joint-limit diagnostics mismatch for {record.scene_id}")
             if not np.array_equal(artifact["robot_pose"], expected_artifact["robot_pose"]):
                 raise ValueError(f"artifact export mismatch for {record.scene_id}")
-            validate_artifact(artifact, record, export_stage_q)
+            validate_artifact(
+                artifact,
+                record,
+                export_stage_q,
+                palm_object_transforms=palm_object_transforms,
+            )
             completed_scenes += 1
         elif scene["status"] == "failed":
             failed_raw_path = output_root / scene["failed_raw_artifact"]
@@ -1023,6 +1111,8 @@ def validate_run_outputs(output_root: Path) -> dict:
             )
             if raw.get("schema_version") != expected_raw_schema or "scene_failure" not in raw:
                 raise ValueError(f"failed raw diagnostics are incomplete for {record.scene_id}")
+            if persisted_palm_fk is not None and raw.get("palm_fk") != persisted_palm_fk:
+                raise ValueError(f"palm FK provenance mismatch for {record.scene_id}")
             if run_schema_version == RUN_SCHEMA_VERSION:
                 if raw.get("scene") != record.to_manifest():
                     raise ValueError(f"table scene provenance mismatch for {record.scene_id}")

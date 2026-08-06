@@ -13,6 +13,7 @@ import numpy as np
 
 from .contracts import (
     BENCH_SHADOW_JOINT_NAMES,
+    DRO_BENCH_LINK_PAIRS,
     DRO_SHADOW_Q_NAMES,
     LEGACY_RAW_SCHEMA_VERSION,
     LEGACY_RUN_SCHEMA_VERSION,
@@ -20,11 +21,15 @@ from .contracts import (
     RUN_SCHEMA_VERSION,
     STAGE_NAMES,
     SUPPORTED_RUN_SCHEMA_VERSIONS,
+    build_dro_shadow_pk_chain,
     clamp_dro_shadow_export_stages,
     dro_q_to_bench_pose,
+    dro_stage_q_to_object_palm_transforms,
+    legacy_dro_stage_q_to_object_palm_transforms,
     load_dro_shadow_finger_joint_limits,
     load_scene_record,
     make_bench_artifact,
+    map_dro_shadow_fingers,
     matrix_to_pose_wxyz,
     pose_wxyz_to_matrix,
     sha256_array,
@@ -61,6 +66,7 @@ class LoadedScene:
     record: object
     raw: dict
     artifact: dict
+    palm_object_transforms: np.ndarray
     raw_path: Path
     artifact_path: Path
 
@@ -77,6 +83,9 @@ class PreparedSelection:
     object_mesh: MeshData
     object_point_cloud_world: np.ndarray
     hand_meshes: dict
+    dro_component_meshes: dict
+    bench_hand_meshes: dict
+    common_link_frames: dict
     object_pose_wxyz: np.ndarray
     palm_poses_wxyz: dict
     diagnostics: dict
@@ -95,6 +104,13 @@ class _Joint:
 @dataclass(frozen=True)
 class _LinkMesh:
     link_name: str
+    vertices: np.ndarray
+    faces: np.ndarray
+
+
+@dataclass(frozen=True)
+class _BenchGeomMesh:
+    geom_id: int
     vertices: np.ndarray
     faces: np.ndarray
 
@@ -419,29 +435,275 @@ class ShadowHandModel:
             raise ValueError(f"Shadow URDF kinematic tree is disconnected: {missing}")
         return transforms
 
-    def mesh(self, q: np.ndarray, object_world: np.ndarray) -> MeshData:
-        """Build the complete hand mesh in the DGN2k world frame."""
+    def mesh(
+        self,
+        q: np.ndarray,
+        object_world: np.ndarray,
+        *,
+        include_links=None,
+        exclude_links=(),
+    ) -> MeshData:
+        """Build selected URDF visual links in the DGN2k world frame."""
 
         transforms = self.link_transforms(q)
+        included = None if include_links is None else set(include_links)
+        excluded = set(exclude_links)
         vertices = []
         faces = []
         vertex_offset = 0
+        source_count = 0
         for link_mesh in self._link_meshes:
+            if (
+                (included is not None and link_mesh.link_name not in included)
+                or link_mesh.link_name in excluded
+            ):
+                continue
             world = object_world @ transforms[link_mesh.link_name]
             transformed = _transform_points(link_mesh.vertices, world)
             vertices.append(transformed)
             faces.append(link_mesh.faces + vertex_offset)
             vertex_offset += len(transformed)
+            source_count += 1
+        if not vertices:
+            raise ValueError("selected Shadow links contain no renderable visual geometry")
         return MeshData(
             vertices=np.concatenate(vertices, axis=0).astype(np.float32),
             faces=np.concatenate(faces, axis=0).astype(np.int32),
-            source_count=len(self._link_meshes),
+            source_count=source_count,
         )
 
     def palm_world_transform(self, q: np.ndarray, object_world: np.ndarray) -> np.ndarray:
         """Return ``T_WH`` from generic URDF FK."""
 
         return object_world @ self.link_transforms(q)["palm"]
+
+
+class BenchShadowHandModel:
+    """CPU MuJoCo FK and visual meshes for the palm-root Bench Shadow asset."""
+
+    def __init__(self, mjcf_path: Path):
+        try:
+            import mujoco
+        except ImportError as error:
+            raise RuntimeError("mujoco is required for the DRO/Bench overlay") from error
+
+        self._mujoco = mujoco
+        self.mjcf_path = Path(mjcf_path).resolve(strict=True)
+        self.model = mujoco.MjModel.from_xml_path(str(self.mjcf_path))
+        self.data = mujoco.MjData(self.model)
+        joint_names = tuple(
+            mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, index)
+            for index in range(self.model.njnt)
+        )
+        if (
+            set(joint_names) != set(BENCH_SHADOW_JOINT_NAMES)
+            or len(joint_names) != len(BENCH_SHADOW_JOINT_NAMES)
+            or self.model.nq != len(BENCH_SHADOW_JOINT_NAMES)
+        ):
+            raise ValueError(f"Bench Shadow joint set mismatch: {joint_names}")
+        if mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_BODY, "rh_palm"
+        ) < 0:
+            raise ValueError("Bench Shadow MJCF has no rh_palm root body")
+
+        self._joint_qpos_addresses = {}
+        for name in BENCH_SHADOW_JOINT_NAMES:
+            joint_id = mujoco.mj_name2id(
+                self.model, mujoco.mjtObj.mjOBJ_JOINT, name
+            )
+            self._joint_qpos_addresses[name] = int(self.model.jnt_qposadr[joint_id])
+
+        meshes = []
+        for geom_id in range(self.model.ngeom):
+            if int(self.model.geom_group[geom_id]) != 2:
+                continue
+            mesh_id = int(self.model.geom_dataid[geom_id])
+            if mesh_id < 0:
+                continue
+            vertex_start = int(self.model.mesh_vertadr[mesh_id])
+            vertex_count = int(self.model.mesh_vertnum[mesh_id])
+            face_start = int(self.model.mesh_faceadr[mesh_id])
+            face_count = int(self.model.mesh_facenum[mesh_id])
+            meshes.append(
+                _BenchGeomMesh(
+                    geom_id=geom_id,
+                    vertices=np.asarray(
+                        self.model.mesh_vert[
+                            vertex_start : vertex_start + vertex_count
+                        ],
+                        dtype=np.float64,
+                    ).copy(),
+                    faces=np.asarray(
+                        self.model.mesh_face[face_start : face_start + face_count],
+                        dtype=np.int64,
+                    ).copy(),
+                )
+            )
+        if not meshes:
+            raise ValueError("Bench Shadow MJCF contains no group-2 visual mesh geoms")
+        self._geom_meshes = tuple(meshes)
+
+        required_bodies = {"rh_palm", *DRO_BENCH_LINK_PAIRS.values()}
+        missing = sorted(
+            name
+            for name in required_bodies
+            if mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, name) < 0
+        )
+        if missing:
+            raise ValueError(f"Bench Shadow MJCF is missing common bodies: {missing}")
+
+    def _forward(self, joint_values: np.ndarray) -> None:
+        values = np.asarray(joint_values, dtype=np.float64).reshape(-1)
+        if values.shape != (len(BENCH_SHADOW_JOINT_NAMES),) or not np.isfinite(
+            values
+        ).all():
+            raise ValueError(
+                "Bench Shadow joint values must be finite shape "
+                f"{(len(BENCH_SHADOW_JOINT_NAMES),)}"
+            )
+        self.data.qpos[:] = 0.0
+        for name, value in zip(BENCH_SHADOW_JOINT_NAMES, values):
+            self.data.qpos[self._joint_qpos_addresses[name]] = value
+        self._mujoco.mj_kinematics(self.model, self.data)
+
+    def _body_transform(self, name: str) -> np.ndarray:
+        body_id = self._mujoco.mj_name2id(
+            self.model, self._mujoco.mjtObj.mjOBJ_BODY, name
+        )
+        transform = np.eye(4, dtype=np.float64)
+        transform[:3, :3] = self.data.xmat[body_id].reshape(3, 3)
+        transform[:3, 3] = self.data.xpos[body_id]
+        return transform
+
+    def local_body_transforms(self, joint_values: np.ndarray) -> dict:
+        """Return standalone-MJCF transforms before applying the palm world pose."""
+
+        self._forward(joint_values)
+        names = {"rh_palm", *DRO_BENCH_LINK_PAIRS.values()}
+        return {name: self._body_transform(name) for name in names}
+
+    def world_body_transforms(
+        self, joint_values: np.ndarray, palm_world: np.ndarray
+    ) -> dict:
+        """Place standalone Bench bodies under the exported ``rh_palm`` pose."""
+
+        local = self.local_body_transforms(joint_values)
+        root_world = np.asarray(palm_world, dtype=np.float64).reshape(4, 4)
+        model_to_world = root_world @ np.linalg.inv(local["rh_palm"])
+        return {name: model_to_world @ transform for name, transform in local.items()}
+
+    def mesh(self, joint_values: np.ndarray, palm_world: np.ndarray) -> MeshData:
+        """Build the Bench group-2 visual mesh under the exported palm pose."""
+
+        self._forward(joint_values)
+        local_palm = self._body_transform("rh_palm")
+        model_to_world = (
+            np.asarray(palm_world, dtype=np.float64).reshape(4, 4)
+            @ np.linalg.inv(local_palm)
+        )
+        vertices = []
+        faces = []
+        vertex_offset = 0
+        for item in self._geom_meshes:
+            geom_transform = np.eye(4, dtype=np.float64)
+            geom_transform[:3, :3] = self.data.geom_xmat[item.geom_id].reshape(3, 3)
+            geom_transform[:3, 3] = self.data.geom_xpos[item.geom_id]
+            transformed = _transform_points(
+                item.vertices, model_to_world @ geom_transform
+            )
+            vertices.append(transformed)
+            faces.append(item.faces + vertex_offset)
+            vertex_offset += len(transformed)
+        return MeshData(
+            vertices=np.concatenate(vertices, axis=0).astype(np.float32),
+            faces=np.concatenate(faces, axis=0).astype(np.int32),
+            source_count=len(self._geom_meshes),
+        )
+
+
+def _rotation_error(left: np.ndarray, right: np.ndarray) -> float:
+    def project(rotation):
+        u, _, vt = np.linalg.svd(rotation)
+        projected = u @ vt
+        if np.linalg.det(projected) < 0.0:
+            u[:, -1] *= -1.0
+            projected = u @ vt
+        return projected
+
+    delta = project(left[:3, :3]).T @ project(right[:3, :3])
+    cosine = np.clip((np.trace(delta) - 1.0) * 0.5, -1.0, 1.0)
+    return float(np.arccos(cosine))
+
+
+def compare_dro_bench_links(
+    dro_model: ShadowHandModel,
+    bench_model: BenchShadowHandModel,
+    q: np.ndarray,
+    bench_joint_values: np.ndarray,
+    object_world: np.ndarray,
+    palm_world: np.ndarray,
+) -> tuple:
+    """Compare palm/common-link origins with zero-pose frame alignment."""
+
+    pairs = {"palm": "rh_palm", **DRO_BENCH_LINK_PAIRS}
+    zero_dro = dro_model.link_transforms(np.zeros(len(DRO_SHADOW_Q_NAMES)))
+    zero_bench = bench_model.local_body_transforms(
+        np.zeros(len(BENCH_SHADOW_JOINT_NAMES))
+    )
+    zero_dro_palm_inverse = np.linalg.inv(zero_dro["palm"])
+    zero_bench_palm_inverse = np.linalg.inv(zero_bench["rh_palm"])
+
+    dro_object = dro_model.link_transforms(q)
+    dro_world = {
+        name: object_world @ transform for name, transform in dro_object.items()
+    }
+    bench_world = bench_model.world_body_transforms(
+        bench_joint_values, palm_world
+    )
+    details = {}
+    frames = {}
+    max_position_error = -1.0
+    max_rotation_error = -1.0
+    worst_position_link = None
+    worst_rotation_link = None
+    for dro_link, bench_body in pairs.items():
+        dro_zero_relative = zero_dro_palm_inverse @ zero_dro[dro_link]
+        bench_zero_relative = zero_bench_palm_inverse @ zero_bench[bench_body]
+        frame_alignment = (
+            dro_zero_relative[:3, :3].T @ bench_zero_relative[:3, :3]
+        )
+        dro_aligned = dro_world[dro_link].copy()
+        dro_aligned[:3, :3] = dro_aligned[:3, :3] @ frame_alignment
+        bench_transform = bench_world[bench_body]
+        position_error = float(
+            np.linalg.norm(dro_aligned[:3, 3] - bench_transform[:3, 3])
+        )
+        rotation_error = _rotation_error(dro_aligned, bench_transform)
+        details[dro_link] = {
+            "bench_body": bench_body,
+            "position_error_m": position_error,
+            "rotation_error_rad": rotation_error,
+        }
+        frames[dro_link] = {
+            "dro": matrix_to_pose_wxyz(dro_aligned),
+            "bench": matrix_to_pose_wxyz(bench_transform),
+        }
+        if position_error > max_position_error:
+            max_position_error = position_error
+            worst_position_link = dro_link
+        if rotation_error > max_rotation_error:
+            max_rotation_error = rotation_error
+            worst_rotation_link = dro_link
+    return (
+        {
+            "max_link_position_error_m": max_position_error,
+            "max_link_rotation_error_rad": max_rotation_error,
+            "worst_link": worst_position_link,
+            "worst_rotation_link": worst_rotation_link,
+            "link_errors": details,
+        },
+        frames,
+    )
 
 
 class ViewerRun:
@@ -531,6 +793,16 @@ class ViewerRun:
             raise ValueError("run manifest is missing shadow_urdf_sha256")
         if sha256_file(self.shadow_urdf) != expected_urdf_hash:
             raise ValueError("Shadow URDF hash does not match the persisted run manifest")
+        self.palm_fk_metadata = self.manifest.get("palm_fk")
+        if self.palm_fk_metadata is None:
+            self.palm_fk_chain = None
+        else:
+            from .runner import _validate_palm_fk_manifest
+
+            _validate_palm_fk_manifest(self.palm_fk_metadata, self.shadow_urdf)
+            self.palm_fk_chain = build_dro_shadow_pk_chain(
+                self.shadow_urdf, device="cpu"
+            )
 
         candidate_count = self.resolved_config.get("candidate_count")
         if (
@@ -636,6 +908,14 @@ class ViewerRun:
             )
         )
 
+    def _palm_object_transforms(self, stage_q: np.ndarray) -> np.ndarray:
+        if self.palm_fk_chain is None:
+            return legacy_dro_stage_q_to_object_palm_transforms(stage_q)
+        return dro_stage_q_to_object_palm_transforms(
+            self.palm_fk_chain,
+            stage_q,
+        )
+
     def _validate_scene_provenance(self, entry: OutputScene, record, raw: dict) -> None:
         expected = record.to_manifest()
         manifest_scene = entry.manifest
@@ -729,6 +1009,8 @@ class ViewerRun:
             raise ValueError(f"stage order mismatch for {scene_id}")
         if raw.get("dro_q_names") != list(DRO_SHADOW_Q_NAMES):
             raise ValueError(f"DRO q order mismatch for {scene_id}")
+        if raw.get("palm_fk") != self.palm_fk_metadata:
+            raise ValueError(f"palm FK provenance mismatch for {scene_id}")
         self._validate_scene_provenance(entry, record, raw)
         if self.run_schema_version == RUN_SCHEMA_VERSION:
             from .runner import _validate_v2_initialization_raw
@@ -779,12 +1061,17 @@ class ViewerRun:
         if raw.get("export_clamp_diagnostics") != expected_clamps:
             raise ValueError(f"export clamp diagnostics mismatch for {scene_id}")
 
+        palm_object_transforms = self._palm_object_transforms(export_stage_q)
+
         if set(artifact) != {"robot_pose", "joint_names", "scene_path"}:
             raise ValueError(f"grasp artifact keys do not match the Bench contract for {scene_id}")
         if artifact.get("joint_names") != list(BENCH_SHADOW_JOINT_NAMES):
             raise ValueError(f"Bench joint order mismatch for {scene_id}")
         expected_artifact, expected_excess = make_bench_artifact(
-            export_stage_q, record.object_pose_wxyz, record.stored_scene_path
+            export_stage_q,
+            record.object_pose_wxyz,
+            record.stored_scene_path,
+            palm_object_transforms=palm_object_transforms,
         )
         robot_pose = np.asarray(artifact.get("robot_pose"))
         if robot_pose.shape != (
@@ -801,7 +1088,12 @@ class ViewerRun:
             raise ValueError(f"robot_pose contains non-finite values for {scene_id}")
         if not np.array_equal(robot_pose, expected_artifact["robot_pose"]):
             raise ValueError(f"persisted robot_pose round-trip mismatch for {scene_id}")
-        validate_artifact(artifact, record, export_stage_q)
+        validate_artifact(
+            artifact,
+            record,
+            export_stage_q,
+            palm_object_transforms=palm_object_transforms,
+        )
         persisted_excess = np.asarray(raw.get("bench_joint_limit_excess"))
         if (
             persisted_excess.shape != expected_excess.shape
@@ -814,6 +1106,7 @@ class ViewerRun:
             record=record,
             raw=raw,
             artifact=artifact,
+            palm_object_transforms=palm_object_transforms,
             raw_path=raw_path,
             artifact_path=artifact_path,
         )
@@ -823,6 +1116,7 @@ class ViewerRun:
         hand_model: ShadowHandModel,
         scene_id: str,
         *,
+        bench_model: Optional[BenchShadowHandModel] = None,
         candidate_index: int = 0,
         stage: str = "grasp",
         mode: str = "three_poses",
@@ -841,8 +1135,12 @@ class ViewerRun:
             )
         if stage not in STAGE_NAMES:
             raise ValueError(f"unknown stage {stage!r}; expected one of {STAGE_NAMES}")
-        if mode not in {"single_stage", "three_poses"}:
-            raise ValueError("mode must be single_stage or three_poses")
+        if mode not in {"single_stage", "three_poses", "dro_bench_overlay"}:
+            raise ValueError(
+                "mode must be single_stage, three_poses, or dro_bench_overlay"
+            )
+        if mode == "dro_bench_overlay" and bench_model is None:
+            raise ValueError("dro_bench_overlay mode requires --bench-mjcf")
         if pose_source not in {"exported", "raw"}:
             raise ValueError("pose_source must be exported or raw")
         loaded = self.load_scene(scene_id)
@@ -864,19 +1162,32 @@ class ViewerRun:
         q_values = np.asarray(loaded.raw[q_key])
         stage_names = STAGE_NAMES if mode == "three_poses" else (stage,)
         hand_meshes = {}
+        dro_component_meshes = {}
+        bench_hand_meshes = {}
+        common_link_frames = {}
         palm_poses = {}
+        link_diagnostics = []
         stage_diagnostics = []
         for stage_name in stage_names:
             stage_index = STAGE_NAMES.index(stage_name)
             q = q_values[candidate_index, stage_index]
             hand_meshes[stage_name] = hand_model.mesh(q, object_world)
-            palm_world = hand_model.palm_world_transform(q, object_world)
-            expected_pose, _ = dro_q_to_bench_pose(q, record.object_pose_wxyz)
+            # The approved clamp changes finger joints only, so raw and exported
+            # controller states share the same palm FK for a given stage.
+            palm_object = loaded.palm_object_transforms[
+                candidate_index, stage_index
+            ]
+            palm_world = object_world @ palm_object
+            expected_pose, _ = dro_q_to_bench_pose(
+                q,
+                record.object_pose_wxyz,
+                palm_object_transform=palm_object,
+            )
             if not np.allclose(
-                palm_world,
+                hand_model.palm_world_transform(q, object_world),
                 pose_wxyz_to_matrix(expected_pose[:7]),
                 rtol=0.0,
-                atol=1e-8,
+                atol=1e-6,
             ):
                 raise ValueError(
                     f"Shadow URDF palm FK does not match T_WH for {scene_id} "
@@ -893,6 +1204,48 @@ class ViewerRun:
                         f"{scene_id} candidate {candidate_index} stage {stage_name}"
                     )
             palm_poses[stage_name] = palm_pose
+
+            if mode == "dro_bench_overlay":
+                dro_component_meshes.setdefault("forearm", {})[stage_name] = (
+                    hand_model.mesh(q, object_world, include_links={"forearm"})
+                )
+                dro_component_meshes.setdefault("wrist", {})[stage_name] = (
+                    hand_model.mesh(q, object_world, include_links={"wrist"})
+                )
+                dro_component_meshes.setdefault("palm_fingers", {})[stage_name] = (
+                    hand_model.mesh(
+                        q,
+                        object_world,
+                        exclude_links={"forearm", "wrist"},
+                    )
+                )
+                if pose_source == "exported":
+                    bench_joint_values = np.asarray(loaded.artifact["robot_pose"])[
+                        0, candidate_index, stage_index, 7:
+                    ]
+                    bench_palm_world = pose_wxyz_to_matrix(
+                        np.asarray(loaded.artifact["robot_pose"])[
+                            0, candidate_index, stage_index, :7
+                        ]
+                    )
+                else:
+                    bench_joint_values, _ = map_dro_shadow_fingers(q)
+                    bench_palm_world = palm_world
+                bench_hand_meshes[stage_name] = bench_model.mesh(
+                    bench_joint_values,
+                    bench_palm_world,
+                )
+                alignment, frames = compare_dro_bench_links(
+                    hand_model,
+                    bench_model,
+                    q,
+                    bench_joint_values,
+                    object_world,
+                    bench_palm_world,
+                )
+                alignment["stage_name"] = stage_name
+                link_diagnostics.append(alignment)
+                common_link_frames[stage_name] = frames
 
         if not np.allclose(
             np.stack(list(palm_poses.values())),
@@ -914,6 +1267,27 @@ class ViewerRun:
         max_delta = max(
             (abs(float(item["delta"])) for item in stage_diagnostics), default=0.0
         )
+        max_link_position_error = max(
+            (
+                float(item["max_link_position_error_m"])
+                for item in link_diagnostics
+            ),
+            default=None,
+        )
+        max_link_rotation_error = max(
+            (
+                float(item["max_link_rotation_error_rad"])
+                for item in link_diagnostics
+            ),
+            default=None,
+        )
+        worst_link = None
+        if link_diagnostics:
+            worst_item = max(
+                link_diagnostics,
+                key=lambda item: float(item["max_link_position_error_m"]),
+            )
+            worst_link = worst_item["worst_link"]
         diagnostics = {
             "scene_id": scene_id,
             "object_id": record.object_id,
@@ -938,6 +1312,16 @@ class ViewerRun:
             "clamp_count": len(stage_diagnostics),
             "clamp_max_abs_delta": max_delta,
             "clamps": stage_diagnostics,
+            "palm_fk": self.palm_fk_metadata or {
+                "backend": "legacy_hand_written_compatibility"
+            },
+            "bench_mjcf": (
+                str(bench_model.mjcf_path) if bench_model is not None else None
+            ),
+            "max_link_position_error_m": max_link_position_error,
+            "max_link_rotation_error_rad": max_link_rotation_error,
+            "worst_link": worst_link,
+            "link_alignment": link_diagnostics,
             "adapter_source": self.manifest.get("source"),
             "checkpoint_sha256": self.manifest.get("checkpoint_sha256"),
             "source_scene_manifest_sha256": self.manifest.get(
@@ -955,6 +1339,9 @@ class ViewerRun:
             object_mesh=object_mesh,
             object_point_cloud_world=points_world,
             hand_meshes=hand_meshes,
+            dro_component_meshes=dro_component_meshes,
+            bench_hand_meshes=bench_hand_meshes,
+            common_link_frames=common_link_frames,
             object_pose_wxyz=record.object_pose_wxyz.copy(),
             palm_poses_wxyz=palm_poses,
             diagnostics=diagnostics,
@@ -975,6 +1362,15 @@ def diagnostics_markdown(prepared: PreparedSelection, run: ViewerRun) -> str:
             f"{_failure_message(failure) or 'no message'}"
         )
     failed_text = "\n".join(failed_lines) if failed_lines else "- none"
+    if value["max_link_position_error_m"] is None:
+        alignment_text = "- DRO/Bench overlay: not selected\n"
+    else:
+        alignment_text = (
+            "- DRO/Bench max common-link position / rotation error: "
+            f"`{value['max_link_position_error_m']:.9g} m` / "
+            f"`{value['max_link_rotation_error_rad']:.9g} rad`\n"
+            f"- Worst position link: `{value['worst_link']}`\n"
+        )
     return (
         "### Current selection\n"
         f"- Scene: `{value['scene_id']}`\n"
@@ -989,6 +1385,7 @@ def diagnostics_markdown(prepared: PreparedSelection, run: ViewerRun) -> str:
         f"- Bench artifact: `{value['grasp_artifact']}`\n"
         f"- Adapter commit: `{commit}`\n"
         f"- Frame: `{value['frame_contract']}`\n"
+        f"{alignment_text}"
         "\n### Failed scenes (not renderable)\n"
         f"{failed_text}"
     )

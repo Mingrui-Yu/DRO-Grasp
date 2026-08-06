@@ -21,9 +21,12 @@ if str(GRASP_GENERATION_ROOT) not in sys.path:
 from experiments.bimanbodex_dro.contracts import (  # noqa: E402
     BENCH_FROM_DRO,
     BENCH_SHADOW_JOINT_NAMES,
+    DRO_BENCH_LINK_PAIRS,
     DRO_SHADOW_Q_NAMES,
+    build_dro_shadow_pk_chain,
+    clamp_dro_shadow_export_stages,
     dro_q_to_bench_pose,
-    dro_q_to_object_palm_transform,
+    dro_stage_q_to_object_palm_transforms,
     map_dro_shadow_fingers,
     pose_wxyz_to_matrix,
 )
@@ -31,32 +34,6 @@ from experiments.bimanbodex_dro.initialization import (  # noqa: E402
     PALM_APPROACH_AXIS_LOCAL,
     PALM_APPROACH_AXIS_SIGN,
 )
-
-LINK_PAIRS = {
-    "ffknuckle": "rh_ffknuckle",
-    "ffproximal": "rh_ffproximal",
-    "ffmiddle": "rh_ffmiddle",
-    "ffdistal": "rh_ffdistal",
-    "mfknuckle": "rh_mfknuckle",
-    "mfproximal": "rh_mfproximal",
-    "mfmiddle": "rh_mfmiddle",
-    "mfdistal": "rh_mfdistal",
-    "rfknuckle": "rh_rfknuckle",
-    "rfproximal": "rh_rfproximal",
-    "rfmiddle": "rh_rfmiddle",
-    "rfdistal": "rh_rfdistal",
-    "lfmetacarpal": "rh_lfmetacarpal",
-    "lfknuckle": "rh_lfknuckle",
-    "lfproximal": "rh_lfproximal",
-    "lfmiddle": "rh_lfmiddle",
-    "lfdistal": "rh_lfdistal",
-    "thbase": "rh_thbase",
-    "thproximal": "rh_thproximal",
-    "thhub": "rh_thhub",
-    "thmiddle": "rh_thmiddle",
-    "thdistal": "rh_thdistal",
-}
-
 
 def _vector(value: Optional[str], default=(0.0, 0.0, 0.0)) -> np.ndarray:
     return np.fromstring(value, sep=" ", dtype=np.float64) if value else np.asarray(default, dtype=np.float64)
@@ -164,7 +141,15 @@ def _mujoco_body_transform(model, data, name: str) -> np.ndarray:
 
 
 def _rotation_error(left: np.ndarray, right: np.ndarray) -> float:
-    delta = left[:3, :3].T @ right[:3, :3]
+    def project(rotation):
+        u, _, vt = np.linalg.svd(rotation)
+        projected = u @ vt
+        if np.linalg.det(projected) < 0.0:
+            u[:, -1] *= -1.0
+            projected = u @ vt
+        return projected
+
+    delta = project(left[:3, :3]).T @ project(right[:3, :3])
     cosine = np.clip((np.trace(delta) - 1.0) * 0.5, -1.0, 1.0)
     return float(np.arccos(cosine))
 
@@ -179,6 +164,7 @@ def validate(
     by_parent, urdf_limits = load_urdf(urdf_path)
     if tuple(urdf_limits) != DRO_SHADOW_Q_NAMES:
         raise ValueError(f"DRO q order mismatch: {tuple(urdf_limits)}")
+    pk_chain = build_dro_shadow_pk_chain(urdf_path, device="cpu")
 
     model = mujoco.MjModel.from_xml_path(str(bench_mjcf))
     data = mujoco.MjData(model)
@@ -203,14 +189,14 @@ def validate(
     rng = np.random.default_rng(seed)
     zero_q = {name: 0.0 for name in DRO_SHADOW_Q_NAMES}
     zero_urdf = urdf_forward_kinematics(by_parent, zero_q)
-    mujoco.mj_forward(model, data)
+    mujoco.mj_kinematics(model, data)
     zero_urdf_palm_inverse = np.linalg.inv(zero_urdf["palm"])
     zero_bench_palm_inverse = np.linalg.inv(
         _mujoco_body_transform(model, data, "rh_palm")
     )
     frame_alignments = {}
     max_fixed_frame_offset = 0.0
-    for urdf_link, bench_body in LINK_PAIRS.items():
+    for urdf_link, bench_body in DRO_BENCH_LINK_PAIRS.items():
         urdf_relative = zero_urdf_palm_inverse @ zero_urdf[urdf_link]
         bench_relative = zero_bench_palm_inverse @ _mujoco_body_transform(
             model, data, bench_body
@@ -230,6 +216,7 @@ def validate(
     max_joint_range_excess = 0.0
     max_palm_approach_axis_fk_error = 0.0
     max_exported_approach_axis_error = 0.0
+    max_export_clamp_delta = 0.0
     worst_link = None
 
     for _ in range(samples):
@@ -239,9 +226,24 @@ def validate(
             if name.startswith("virtual_joint_"):
                 lower, upper = (-0.2, 0.2) if name in DRO_SHADOW_Q_NAMES[:3] else (-0.8, 0.8)
             q[index] = rng.uniform(lower, upper)
+        export_stages, clamp_diagnostics = clamp_dro_shadow_export_stages(
+            np.repeat(q.reshape(1, 1, -1), 3, axis=1),
+            urdf_limits,
+        )
+        q = export_stages[0, 0]
+        max_export_clamp_delta = max(
+            max_export_clamp_delta,
+            max(
+                (abs(float(item["delta"])) for item in clamp_diagnostics),
+                default=0.0,
+            ),
+        )
         q_by_name = dict(zip(DRO_SHADOW_Q_NAMES, q))
         urdf_status = urdf_forward_kinematics(by_parent, q_by_name)
-        contract_palm = dro_q_to_object_palm_transform(q)
+        contract_palm = dro_stage_q_to_object_palm_transforms(
+            pk_chain,
+            np.repeat(q.reshape(1, 1, -1), 3, axis=1),
+        )[0, 0]
         urdf_palm = urdf_status["palm"]
         max_root_position_error = max(
             max_root_position_error,
@@ -257,7 +259,9 @@ def validate(
             float(np.linalg.norm(contract_axis - urdf_axis)),
         )
         bench_pose, _ = dro_q_to_bench_pose(
-            q, np.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
+            q,
+            np.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]),
+            palm_object_transform=contract_palm,
         )
         exported_axis = (
             pose_wxyz_to_matrix(bench_pose[:7])[:3, :3]
@@ -279,11 +283,11 @@ def validate(
             max_joint_range_excess = max(
                 max_joint_range_excess, max(lower - value, value - upper, 0.0)
             )
-        mujoco.mj_forward(model, data)
+        mujoco.mj_kinematics(model, data)
         bench_palm = _mujoco_body_transform(model, data, "rh_palm")
         inverse_urdf_palm = np.linalg.inv(urdf_palm)
         inverse_bench_palm = np.linalg.inv(bench_palm)
-        for urdf_link, bench_body in LINK_PAIRS.items():
+        for urdf_link, bench_body in DRO_BENCH_LINK_PAIRS.items():
             urdf_relative = inverse_urdf_palm @ urdf_status[urdf_link]
             bench_relative = inverse_bench_palm @ _mujoco_body_transform(model, data, bench_body)
             position_error = float(
@@ -305,6 +309,7 @@ def validate(
         "dro_q_names": list(DRO_SHADOW_Q_NAMES),
         "bench_joint_names": list(BENCH_SHADOW_JOINT_NAMES),
         "mapping": BENCH_FROM_DRO,
+        "palm_fk_backend": "pytorch_kinematics",
         "max_root_position_error_m": max_root_position_error,
         "max_root_rotation_error_rad": max_root_rotation_error,
         "max_link_position_error_m": max_link_position_error,
@@ -315,6 +320,7 @@ def validate(
         "palm_approach_axis_sign": PALM_APPROACH_AXIS_SIGN,
         "max_palm_approach_axis_fk_error": max_palm_approach_axis_fk_error,
         "max_exported_approach_axis_error": max_exported_approach_axis_error,
+        "max_export_clamp_delta_rad": max_export_clamp_delta,
         "worst_link": worst_link,
     }
 
@@ -326,8 +332,9 @@ def main() -> None:
     parser.add_argument("--bench-hand-config", type=Path, required=True)
     parser.add_argument("--samples", type=int, default=128)
     parser.add_argument("--seed", type=int, default=240826)
-    parser.add_argument("--max-position-error", type=float, default=0.002)
+    parser.add_argument("--max-position-error", type=float, default=0.0005)
     parser.add_argument("--max-rotation-error", type=float, default=0.003)
+    parser.add_argument("--max-export-clamp-delta", type=float, default=0.0002)
     args = parser.parse_args()
     result = validate(
         args.dro_urdf,
@@ -337,9 +344,9 @@ def main() -> None:
         args.seed,
     )
     print(json.dumps(result, indent=2, sort_keys=True))
-    if result["max_root_position_error_m"] > 1e-9:
+    if result["max_root_position_error_m"] > 1e-7:
         raise SystemExit("DRO root-to-palm contract does not match the release URDF")
-    if result["max_root_rotation_error_rad"] > 1e-7:
+    if result["max_root_rotation_error_rad"] > 1e-6:
         raise SystemExit("DRO root-to-palm rotation does not match the release URDF")
     if result["max_link_position_error_m"] > args.max_position_error:
         raise SystemExit("DRO/Bench link position mismatch exceeds tolerance")
@@ -347,9 +354,11 @@ def main() -> None:
         raise SystemExit("DRO/Bench link rotation mismatch exceeds tolerance")
     if result["max_joint_range_excess_rad"] > 1e-6:
         raise SystemExit("DRO mapping exceeds Bench joint limits")
-    if result["max_palm_approach_axis_fk_error"] > 1e-7:
+    if result["max_export_clamp_delta_rad"] > args.max_export_clamp_delta:
+        raise SystemExit("DRO/Bench export clamp exceeds numerical-residual tolerance")
+    if result["max_palm_approach_axis_fk_error"] > 5e-7:
         raise SystemExit("DRO palm approach axis does not match release URDF FK")
-    if result["max_exported_approach_axis_error"] > 1e-7:
+    if result["max_exported_approach_axis_error"] > 5e-7:
         raise SystemExit("exported Bench approach axis does not match DRO palm +Y")
 
 

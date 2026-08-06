@@ -18,9 +18,12 @@ table collision loss, rejection step, or execution-path check.
 - The released network's official preprocessing is retained: only the robot
   point cloud is zero-centered inside the network (`network_center_robot_pc`);
   object points stay in the exact object-local frame and are not normalized.
-- Scene export: `T_WH = T_WO @ T_OPalm`. `T_OPalm` includes the released
-  floating forearm pose plus `WRJ2/WRJ1`; these wrist joints are not silently
-  dropped into the Bench finger vector.
+- Scene export: `T_WH = T_WO @ T_OPalm`. For every candidate and controller
+  stage, `T_OPalm` is evaluated by the actual released
+  `pytorch_kinematics` chain as `FK_DRO(q)["palm"]`. It includes the floating
+  forearm pose plus `WRJ2/WRJ1`; these wrist joints are not silently dropped
+  into the Bench finger vector. Production export does not use a hand-written
+  wrist or palm offset.
 - Scene input must explicitly contain the `table` plane. Its pose and local
   normal are resolved in world coordinates and persisted in v2 scene
   provenance; the adapter never infers a table from object bounds or names.
@@ -43,8 +46,10 @@ table collision loss, rejection step, or execution-path check.
   finger joints to the intersection of the released DRO URDF and Bench limits,
   with every changed value recorded in raw diagnostics. A numerical validator
   checks joint limits and palm-local FK landmarks.
-- Stages: the official `controller()` output is exported as
-  `q_outer -> pregrasp`, optimized `q -> grasp`, and `q_inner -> squeeze`.
+- Stages: the optimized `predict_q` remains the grasp state. The official
+  `controller(predict_q)` output is exported as `q_outer -> pregrasp`,
+  `predict_q -> grasp`, and `q_inner -> squeeze`; `isaac_q` is not substituted
+  for any of these three stages. Palm FK is evaluated separately for all three.
 - Budget: exactly 20 raw candidates per scene. Candidate seeds and ordering are
   stable and recorded. Both modes consume the released sampler before any
   override, so root translation and `q[6:]` match for each paired candidate.
@@ -74,8 +79,11 @@ copy. `export_clamp_diagnostics` records the candidate, stage, joint, raw and
 clamped values, delta, and both source limit intervals for every clamp.
 New runs use `drograsp.dgn2k.raw.v2` / `drograsp.dgn2k.run.v2` and additionally
 store `released_initial_q`, effective `initial_q`, initialization metadata, the
-explicit table contract, and pre-network RNG digests. Validators and the viewer
-retain read-only support for #24 v1 artifacts; new writes are always v2.
+explicit table contract, pre-network RNG digests, and `palm_fk` provenance
+(`backend`, link, joint order, URDF SHA256, dtype, and device). Validators and
+the viewer retain read-only support for #24 artifacts without `palm_fk` by
+using the old hand-written formula only as an explicit historical compatibility
+path; new writes always use actual PK FK and are v2.
 
 ## Assets and environment
 
@@ -113,6 +121,10 @@ python grasp_generation/scripts/validate_bimanbodex_dro_shadow_mapping.py \
   --bench-hand-config ../BimanDexGraspBench/config/hand/shadow.yaml \
   --samples 128
 ```
+
+The default acceptance threshold is `0.5 mm` maximum common-link origin error.
+Link rotations are compared after a fixed zero-pose frame alignment because
+the URDF link and MJCF body frames can use different constant orientations.
 
 The checked-in `config.json` uses the read-only Heur-Fix reference root
 `../BimanBODex/src/curobo/content/assets/output/sim_shadow/tabletop_full/
@@ -203,6 +215,24 @@ scale, candidate, stage, and either one stage or the three-pose overlay. The
 fixed colors are orange for `pregrasp`, blue for `grasp`, and pink for
 `squeeze`; the selected stage is more opaque in overlay mode. World, object,
 and palm axes and the persisted 512-point input cloud can be toggled separately.
+
+To compare the producer URDF with the exact palm-root Bench asset, add the Bench
+MJCF and select `dro_bench_overlay`:
+
+```bash
+DRO_PYTHON="${DRO_PYTHON:-../.conda-envs/dro/bin/python}"
+"$DRO_PYTHON" grasp_generation/scripts/visualize_bimanbodex_dro.py \
+  --output-root /path/to/read-only/dro-model_3robots-seed240825 \
+  --bench-mjcf ../BimanDexGraspBench/assets/hand/shadow/right_hand_v2.xml \
+  --candidate 0 --stage grasp --mode dro_bench_overlay
+```
+
+This mode renders the same scaled/world-posed DGN2k object, the complete DRO
+URDF, and the Bench group-2 visual meshes rooted at the exported `rh_palm`
+pose. DRO forearm, wrist, and palm/fingers can be hidden independently. Palm
+and common-link axes can be toggled, and diagnostics report maximum position
+and rotation error plus the worst link. The overlay is a frame/asset contract
+check, not grasp success, stability, or table-collision evidence.
 
 The default pose source is `exported`, which reconstructs the actual
 `export_stage_q`/`robot_pose` Bench artifact. `raw` shows the untouched official

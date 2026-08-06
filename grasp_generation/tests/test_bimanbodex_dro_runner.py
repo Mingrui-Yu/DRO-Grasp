@@ -79,15 +79,7 @@ class RunnerTests(unittest.TestCase):
         self.robot_pc = self.root / "shadowhand.pt"
         self.checkpoint.write_bytes(self.checkpoint.name.encode("utf-8"))
         self.robot_pc.write_bytes(self.robot_pc.name.encode("utf-8"))
-        urdf = ["<robot name=\"shadow\">"]
-        for joint_name in DRO_SHADOW_FINGER_JOINT_NAMES:
-            urdf.append(
-                f'<joint name="{joint_name}" type="revolute">'
-                '<limit lower="-10" upper="10"/>'
-                "</joint>"
-            )
-        urdf.append("</robot>\n")
-        self.urdf.write_text("\n".join(urdf), encoding="utf-8")
+        self.urdf.write_text(self._shadow_urdf(), encoding="utf-8")
         self.repo_root = Path(__file__).resolve().parents[2]
         self.config = {
             "robot_name": "shadowhand",
@@ -113,6 +105,47 @@ class RunnerTests(unittest.TestCase):
 
     def tearDown(self):
         self.temporary.cleanup()
+
+    @staticmethod
+    def _shadow_urdf() -> str:
+        lines = ["<robot name=\"shadow\">", "<link name=\"world\"/>"]
+        parent = "world"
+        moving_joints = (
+            ("virtual_joint_x", "prismatic", "1 0 0"),
+            ("virtual_joint_y", "prismatic", "0 1 0"),
+            ("virtual_joint_z", "prismatic", "0 0 1"),
+            ("virtual_joint_roll", "revolute", "1 0 0"),
+            ("virtual_joint_pitch", "revolute", "0 1 0"),
+            ("virtual_joint_yaw", "revolute", "0 0 1"),
+            ("WRJ2", "revolute", "0 1 0"),
+            ("WRJ1", "revolute", "1 0 0"),
+        ) + tuple(
+            (joint_name, "revolute", "1 0 0")
+            for joint_name in DRO_SHADOW_FINGER_JOINT_NAMES
+        )
+        for index, (joint_name, joint_type, axis) in enumerate(moving_joints):
+            child = "palm" if joint_name == "WRJ1" else f"link_{index}"
+            origin = (
+                "0 -0.010 0.21301"
+                if joint_name == "WRJ2"
+                else "0 0 0.034"
+                if joint_name == "WRJ1"
+                else "0 0 0"
+            )
+            lines.extend(
+                (
+                    f'<link name="{child}"/>',
+                    f'<joint name="{joint_name}" type="{joint_type}">',
+                    f'<parent link="{parent}"/><child link="{child}"/>',
+                    f'<origin xyz="{origin}" rpy="0 0 0"/>',
+                    f'<axis xyz="{axis}"/>',
+                    '<limit lower="-10" upper="10" effort="1" velocity="1"/>',
+                    "</joint>",
+                )
+            )
+            parent = child
+        lines.append("</robot>\n")
+        return "\n".join(lines)
 
     def test_released_robot_point_cloud_gets_explicit_network_batch(self):
         released = np.zeros((512, 4), dtype=np.float32)
@@ -344,6 +377,7 @@ class RunnerTests(unittest.TestCase):
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         manifest["schema_version"] = LEGACY_RUN_SCHEMA_VERSION
         manifest.pop("initialization_mode", None)
+        manifest.pop("palm_fk", None)
         manifest["source_scene_manifest_sha256"] = scene_manifest_sha256(
             [record], include_table=False
         )
@@ -372,6 +406,7 @@ class RunnerTests(unittest.TestCase):
             "released_initial_q",
             "initialization_metadata",
             "pre_network_rng_state_sha256",
+            "palm_fk",
         ):
             raw.pop(key, None)
         np.save(raw_path, raw, allow_pickle=True)

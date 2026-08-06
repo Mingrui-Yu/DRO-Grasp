@@ -16,7 +16,9 @@ import numpy as np
 from grasp_generation.experiments.bimanbodex_dro.contracts import (
     DRO_SHADOW_FINGER_JOINT_NAMES,
     DRO_SHADOW_Q_NAMES,
-    dro_q_to_object_palm_transform,
+    legacy_dro_q_to_object_palm_transform,
+    map_dro_shadow_fingers,
+    pose_wxyz_to_matrix,
 )
 from grasp_generation.experiments.bimanbodex_dro.initialization import (
     apply_initialization,
@@ -24,8 +26,10 @@ from grasp_generation.experiments.bimanbodex_dro.initialization import (
 )
 from grasp_generation.experiments.bimanbodex_dro.runner import run
 from grasp_generation.experiments.bimanbodex_dro.visualizer import (
+    BenchShadowHandModel,
     ShadowHandModel,
     ViewerRun,
+    compare_dro_bench_links,
 )
 from grasp_generation.scripts.visualize_bimanbodex_dro import ViewerApp, _initial_scene
 
@@ -136,7 +140,7 @@ class VisualizerTests(unittest.TestCase):
                     f'<joint name="{name}" type="{joint_type}">',
                     f'<parent link="{parent}"/><child link="{child}"/>',
                     '<origin xyz="0 0 0" rpy="0 0 0"/>',
-                    f'<axis xyz="{axis}"/><limit lower="-10" upper="10"/>',
+                    f'<axis xyz="{axis}"/><limit lower="-10" upper="10" effort="1" velocity="1"/>',
                     "</joint>",
                 )
             )
@@ -152,12 +156,12 @@ class VisualizerTests(unittest.TestCase):
                 "</geometry></visual></link>",
                 '<joint name="WRJ2" type="revolute"><parent link="forearm"/>'
                 '<child link="wrist"/><origin xyz="0 -0.010 0.21301" rpy="0 0 0"/>'
-                '<axis xyz="0 1 0"/><limit lower="-10" upper="10"/></joint>',
+                '<axis xyz="0 1 0"/><limit lower="-10" upper="10" effort="1" velocity="1"/></joint>',
                 '<link name="palm"><visual><geometry><box size="0.08 0.02 0.1"/>'
                 "</geometry></visual></link>",
                 '<joint name="WRJ1" type="revolute"><parent link="wrist"/>'
                 '<child link="palm"/><origin xyz="0 0 0.034" rpy="0 0 0"/>'
-                '<axis xyz="1 0 0"/><limit lower="-10" upper="10"/></joint>',
+                '<axis xyz="1 0 0"/><limit lower="-10" upper="10" effort="1" velocity="1"/></joint>',
             )
         )
         parent = "palm"
@@ -170,7 +174,7 @@ class VisualizerTests(unittest.TestCase):
                     f'<joint name="{joint_name}" type="revolute">',
                     f'<parent link="{parent}"/><child link="{child}"/>',
                     '<origin xyz="0 0 0.012" rpy="0 0 0"/>',
-                    '<axis xyz="1 0 0"/><limit lower="-10" upper="10"/>',
+                    '<axis xyz="1 0 0"/><limit lower="-10" upper="10" effort="1" velocity="1"/>',
                     "</joint>",
                 )
             )
@@ -234,6 +238,14 @@ class VisualizerTests(unittest.TestCase):
                 hashlib.sha256(path.read_bytes()).hexdigest(),
             )
         return result
+
+    @staticmethod
+    def _workspace_file(repository: str, relative_path: str):
+        for parent in Path(__file__).resolve().parents:
+            candidate = parent / repository / relative_path
+            if candidate.is_file():
+                return candidate
+        return None
 
     def test_index_prepare_three_exported_poses_and_preserve_input_root(self):
         before = self._snapshot(self.output_root)
@@ -445,23 +457,75 @@ class VisualizerTests(unittest.TestCase):
             ViewerRun(self.output_root)
 
     def test_release_shadow_urdf_builds_full_geometry_and_matches_palm_contract(self):
-        repo_root = Path(__file__).resolve().parents[2]
-        release_urdf = (
-            repo_root
-            / "data/data_urdf/robot/shadowhand/shadow_hand_right_extended.urdf"
+        release_urdf = self._workspace_file(
+            "DRO-Grasp",
+            "data/data_urdf/robot/shadowhand/shadow_hand_right_extended.urdf",
         )
-        if not release_urdf.is_file():
+        if release_urdf is None:
             self.skipTest("release Shadow URDF/assets are not installed")
         hand = ShadowHandModel(release_urdf)
         q = np.zeros(len(DRO_SHADOW_Q_NAMES), dtype=np.float32)
         transforms = hand.link_transforms(q)
         np.testing.assert_allclose(
-            transforms["palm"], dro_q_to_object_palm_transform(q), atol=1e-12
+            transforms["palm"],
+            legacy_dro_q_to_object_palm_transform(q),
+            atol=1e-12,
         )
         mesh = hand.mesh(q, np.eye(4))
         self.assertGreaterEqual(mesh.source_count, 20)
         self.assertGreater(len(mesh.vertices), 100000)
         self.assertGreater(len(mesh.faces), 50000)
+
+    def test_release_dro_and_bench_models_overlay_within_half_millimetre(self):
+        release_urdf = self._workspace_file(
+            "DRO-Grasp",
+            "data/data_urdf/robot/shadowhand/shadow_hand_right_extended.urdf",
+        )
+        bench_mjcf = self._workspace_file(
+            "BimanDexGraspBench",
+            "assets/hand/shadow/right_hand_v2.xml",
+        )
+        if release_urdf is None or bench_mjcf is None:
+            self.skipTest("release DRO/Bench Shadow assets are not installed")
+
+        dro = ShadowHandModel(release_urdf)
+        bench = BenchShadowHandModel(bench_mjcf)
+        q = np.zeros(len(DRO_SHADOW_Q_NAMES), dtype=np.float64)
+        q[DRO_SHADOW_Q_NAMES.index("virtual_joint_x")] = 0.08
+        q[DRO_SHADOW_Q_NAMES.index("virtual_joint_roll")] = 0.15
+        q[DRO_SHADOW_Q_NAMES.index("WRJ2")] = -0.2
+        q[DRO_SHADOW_Q_NAMES.index("WRJ1")] = 0.25
+        q[DRO_SHADOW_Q_NAMES.index("FFJ3")] = 0.4
+        q[DRO_SHADOW_Q_NAMES.index("LFJ5")] = 0.3
+        q[DRO_SHADOW_Q_NAMES.index("THJ4")] = 0.5
+        object_world = pose_wxyz_to_matrix(
+            np.array([0.2, -0.1, 0.3, 1.0, 0.0, 0.0, 0.0])
+        )
+        palm_world = dro.palm_world_transform(q, object_world)
+        bench_joints, excess = map_dro_shadow_fingers(q)
+        self.assertEqual(float(np.max(excess)), 0.0)
+        diagnostics, frames = compare_dro_bench_links(
+            dro,
+            bench,
+            q,
+            bench_joints,
+            object_world,
+            palm_world,
+        )
+        self.assertLessEqual(diagnostics["max_link_position_error_m"], 0.0005)
+        self.assertLessEqual(diagnostics["max_link_rotation_error_rad"], 0.003)
+        self.assertEqual(len(frames), 1 + 22)
+
+        bench_mesh = bench.mesh(bench_joints, palm_world)
+        self.assertGreaterEqual(bench_mesh.source_count, 20)
+        self.assertGreater(len(bench_mesh.vertices), 1000)
+        full_dro_mesh = dro.mesh(q, object_world)
+        forearm_mesh = dro.mesh(q, object_world, include_links={"forearm"})
+        wrist_mesh = dro.mesh(q, object_world, include_links={"wrist"})
+        self.assertGreater(forearm_mesh.source_count, 0)
+        self.assertGreater(wrist_mesh.source_count, 0)
+        self.assertLess(forearm_mesh.source_count, full_dro_mesh.source_count)
+        self.assertLess(wrist_mesh.source_count, full_dro_mesh.source_count)
 
 
 if __name__ == "__main__":
