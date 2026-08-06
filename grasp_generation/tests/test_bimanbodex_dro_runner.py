@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import tempfile
 import unittest
@@ -13,6 +14,18 @@ import torch
 from grasp_generation.experiments.bimanbodex_dro.contracts import (
     DRO_SHADOW_FINGER_JOINT_NAMES,
     DRO_SHADOW_Q_NAMES,
+    LEGACY_RAW_SCHEMA_VERSION,
+    LEGACY_RUN_SCHEMA_VERSION,
+    load_scene_record,
+    scene_manifest_sha256,
+)
+from grasp_generation.experiments.bimanbodex_dro.initialization import (
+    apply_initialization,
+    default_initialization_config,
+    resolve_initialization_config,
+)
+from grasp_generation.experiments.bimanbodex_dro.pairing import (
+    validate_paired_outputs,
 )
 from grasp_generation.experiments.bimanbodex_dro.runner import (
     _batch_robot_point_cloud,
@@ -21,6 +34,7 @@ from grasp_generation.experiments.bimanbodex_dro.runner import (
     run,
     validate_run_outputs,
 )
+from grasp_generation.experiments.bimanbodex_dro.visualizer import ViewerRun
 
 
 class RunnerTests(unittest.TestCase):
@@ -48,7 +62,12 @@ class RunnerTests(unittest.TestCase):
                         "file_path": "../../../processed_data/object_a/mesh/simplified.obj",
                         "scale": np.array([0.133, 0.133, 0.133]),
                         "pose": np.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]),
-                    }
+                    },
+                    "table": {
+                        "type": "plane",
+                        "pose": np.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]),
+                        "size": np.array([0.0, 0.0, 1.0]),
+                    },
                 },
             },
             allow_pickle=True,
@@ -125,16 +144,33 @@ class RunnerTests(unittest.TestCase):
     @staticmethod
     def successful_inference(record, points, candidate_seeds):
         count = len(candidate_seeds)
-        initial = np.zeros((count, len(DRO_SHADOW_Q_NAMES)), dtype=np.float32)
+        released = np.zeros((count, len(DRO_SHADOW_Q_NAMES)), dtype=np.float32)
+        initial = released.copy()
+        resolved_initialization = resolve_initialization_config(None, count)
+        metadata = []
+        rng_digests = []
+        for candidate_index, candidate_seed in enumerate(candidate_seeds):
+            initial[candidate_index], item = apply_initialization(
+                released[candidate_index],
+                record,
+                candidate_index,
+                resolved_initialization,
+            )
+            item["candidate_seed"] = candidate_seed
+            metadata.append(item)
+            rng_digests.append({"cpu": format(candidate_index + 1, "064x")})
         stages = np.zeros((count, 3, len(DRO_SHADOW_Q_NAMES)), dtype=np.float32)
         stages[:, 0, DRO_SHADOW_Q_NAMES.index("FFJ1")] = 0.2
         stages[:, 1, DRO_SHADOW_Q_NAMES.index("FFJ1")] = 0.4
         stages[:, 2, DRO_SHADOW_Q_NAMES.index("FFJ1")] = 0.6
         stages[:, 1, DRO_SHADOW_Q_NAMES.index("THJ3")] = 0.5
         return {
+            "released_initial_q": released,
             "initial_q": initial,
             "stage_q": stages,
             "timing_seconds": np.arange(count, dtype=np.float64) / 100.0,
+            "initialization_metadata": metadata,
+            "pre_network_rng_state_sha256": rng_digests,
             "failures": [],
         }
 
@@ -160,6 +196,30 @@ class RunnerTests(unittest.TestCase):
             "timing_seconds": np.zeros((1,), dtype=np.float64),
             "failures": [],
         }
+
+    @staticmethod
+    def inference_for_mode(mode):
+        initialization = default_initialization_config()
+        initialization["mode"] = mode
+        resolved_initialization = resolve_initialization_config(initialization, 20)
+
+        def inference(record, points, candidate_seeds):
+            result = RunnerTests.successful_inference(record, points, candidate_seeds)
+            released = result["released_initial_q"]
+            metadata = []
+            for candidate_index, candidate_seed in enumerate(candidate_seeds):
+                result["initial_q"][candidate_index], item = apply_initialization(
+                    released[candidate_index],
+                    record,
+                    candidate_index,
+                    resolved_initialization,
+                )
+                item["candidate_seed"] = candidate_seed
+                metadata.append(item)
+            result["initialization_metadata"] = metadata
+            return result
+
+        return inference
 
     def test_dry_run_resolves_contract_without_creating_output(self):
         output_root = self.root / "dry-output"
@@ -240,6 +300,85 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(failures[0]["stage"], "inference_driver")
         validation = validate_run_outputs(output_root)
         self.assertEqual(validation["failed_candidate_count"], 20)
+
+    def test_strict_paired_validator_checks_q_rng_and_candidate_identity(self):
+        released_root = self.root / "paired-released"
+        tabletop_root = self.root / "paired-tabletop"
+        released_config = copy.deepcopy(self.config)
+        released_config["output_root"] = str(released_root)
+        released_config["initialization"] = default_initialization_config()
+        tabletop_config = copy.deepcopy(released_config)
+        tabletop_config["output_root"] = str(tabletop_root)
+        tabletop_config["initialization"]["mode"] = "tabletop_stratified"
+        run(
+            self.repo_root,
+            released_config,
+            self.inference_for_mode("released_random"),
+        )
+        run(
+            self.repo_root,
+            tabletop_config,
+            self.inference_for_mode("tabletop_stratified"),
+        )
+        result = validate_paired_outputs(released_root, tabletop_root)
+        self.assertEqual(result["status"], "valid_paired_ablation")
+        self.assertEqual(result["candidate_count_per_mode"], 20)
+        self.assertEqual(result["changed_root_rotation_count"], 20)
+
+        tabletop_raw_path = (
+            tabletop_root / "raw" / "object_a" / "floating" / "scale013.npy"
+        )
+        tabletop_raw = np.load(tabletop_raw_path, allow_pickle=True).item()
+        tabletop_raw["pre_network_rng_state_sha256"][0]["cpu"] = "0" * 64
+        np.save(tabletop_raw_path, tabletop_raw, allow_pickle=True)
+        with self.assertRaisesRegex(ValueError, "pre_network_rng_state_sha256"):
+            validate_paired_outputs(released_root, tabletop_root)
+
+    def test_v1_output_validator_and_viewer_remain_read_only_compatible(self):
+        output_root = self.root / "legacy-v1-output"
+        self.config["output_root"] = str(output_root)
+        run(self.repo_root, self.config, self.successful_inference)
+        record = load_scene_record(self.scene_path, self.scene_root)
+
+        manifest_path = output_root / "run_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["schema_version"] = LEGACY_RUN_SCHEMA_VERSION
+        manifest.pop("initialization_mode", None)
+        manifest["source_scene_manifest_sha256"] = scene_manifest_sha256(
+            [record], include_table=False
+        )
+        table_keys = {
+            "table_type",
+            "table_pose_wxyz",
+            "table_normal_local",
+            "table_normal_world",
+            "table_origin_world",
+        }
+        for key in table_keys:
+            manifest["scenes"][0].pop(key, None)
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        failure_path = output_root / "failure_manifest.json"
+        failure_manifest = json.loads(failure_path.read_text(encoding="utf-8"))
+        failure_manifest["schema_version"] = LEGACY_RUN_SCHEMA_VERSION
+        failure_path.write_text(json.dumps(failure_manifest), encoding="utf-8")
+
+        raw_path = output_root / "raw" / "object_a" / "floating" / "scale013.npy"
+        raw = np.load(raw_path, allow_pickle=True).item()
+        raw["schema_version"] = LEGACY_RAW_SCHEMA_VERSION
+        raw["scene"] = record.to_manifest(include_table=False)
+        for key in (
+            "initialization_mode",
+            "released_initial_q",
+            "initialization_metadata",
+            "pre_network_rng_state_sha256",
+        ):
+            raw.pop(key, None)
+        np.save(raw_path, raw, allow_pickle=True)
+
+        self.assertEqual(validate_run_outputs(output_root)["status"], "valid")
+        loaded = ViewerRun(output_root).load_scene(record.scene_id)
+        self.assertEqual(loaded.raw["schema_version"], LEGACY_RAW_SCHEMA_VERSION)
 
 
 if __name__ == "__main__":

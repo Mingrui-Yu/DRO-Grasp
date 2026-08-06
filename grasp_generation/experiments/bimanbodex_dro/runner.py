@@ -17,13 +17,16 @@ import numpy as np
 
 from .contracts import (
     DRO_SHADOW_Q_NAMES,
+    LEGACY_RAW_SCHEMA_VERSION,
+    LEGACY_RUN_SCHEMA_VERSION,
     RAW_SCHEMA_VERSION,
     RUN_SCHEMA_VERSION,
     STAGE_NAMES,
+    SUPPORTED_RUN_SCHEMA_VERSIONS,
     clamp_dro_shadow_export_stages,
     discover_scene_paths,
-    load_scene_record,
     load_dro_shadow_finger_joint_limits,
+    load_scene_record,
     make_bench_artifact,
     sample_scaled_surface,
     scene_manifest_sha256,
@@ -31,6 +34,12 @@ from .contracts import (
     sha256_array,
     sha256_file,
     validate_artifact,
+)
+from .initialization import (
+    INITIALIZATION_MODES,
+    apply_initialization,
+    resolve_initialization_config,
+    torch_rng_state_digests,
 )
 
 
@@ -180,6 +189,9 @@ def resolve_config(repo_root: Path, config: dict) -> dict:
             raise ValueError(f"{name} must be an integer")
     if resolved["candidate_count"] != 20:
         raise ValueError("candidate_count must remain the approved 20 candidates per scene")
+    resolved["initialization"] = resolve_initialization_config(
+        config.get("initialization"), resolved["candidate_count"]
+    )
     if resolved["point_count"] != 512:
         raise ValueError("point_count must remain the official 512-point contract")
     if resolved["n_iter"] <= 0:
@@ -203,7 +215,9 @@ def resolve_config(repo_root: Path, config: dict) -> dict:
     return resolved
 
 
-def resolve_scene_records(resolved_config: dict) -> tuple[list, list]:
+def resolve_scene_records(
+    resolved_config: dict, *, include_table_in_manifest: bool = True
+) -> tuple[list, list]:
     """Load and validate the authoritative scene set, then select a bounded subset."""
 
     scene_paths = discover_scene_paths(
@@ -222,7 +236,9 @@ def resolve_scene_records(resolved_config: dict) -> tuple[list, list]:
             f"expected {expected_count}, got {len(source_records)}"
         )
     expected_manifest = resolved_config.get("expected_scene_manifest_sha256")
-    actual_manifest = scene_manifest_sha256(source_records)
+    actual_manifest = scene_manifest_sha256(
+        source_records, include_table=include_table_in_manifest
+    )
     if expected_manifest is not None and actual_manifest != expected_manifest:
         raise ValueError(
             "authoritative scene manifest mismatch: "
@@ -286,6 +302,7 @@ def dry_run(repo_root: Path, config: dict) -> dict:
         },
         "shadow_point_cloud_sha256": sha256_file(Path(resolved["shadow_point_cloud"])),
         "resolved_config": resolved,
+        "initialization_mode": resolved["initialization"]["mode"],
     }
 
 
@@ -367,9 +384,14 @@ class OfficialDROInference:
         from utils.se3_transform import compute_link_pose
 
         candidate_count = len(candidate_seeds)
+        released_initial_q = np.full(
+            (candidate_count, len(DRO_SHADOW_Q_NAMES)), np.nan, dtype=np.float32
+        )
         initial_q = np.full((candidate_count, len(DRO_SHADOW_Q_NAMES)), np.nan, dtype=np.float32)
         stage_q = np.full((candidate_count, 3, len(DRO_SHADOW_Q_NAMES)), np.nan, dtype=np.float32)
         timings = np.full((candidate_count,), np.nan, dtype=np.float64)
+        initialization_metadata = [None] * candidate_count
+        pre_network_rng_state_sha256 = [None] * candidate_count
         failures = []
         object_pc = torch.from_numpy(object_points).to(self.device).unsqueeze(0)
 
@@ -379,10 +401,27 @@ class OfficialDROInference:
                 np.random.seed(candidate_seed)
                 torch.manual_seed(candidate_seed)
                 torch.cuda.manual_seed_all(candidate_seed)
-                q_initial = self.hand.get_initial_q().unsqueeze(0).to(self.device)
+                q_released = self.hand.get_initial_q()
+                released_numpy = q_released.detach().cpu().numpy()
+                effective_numpy, proposal_metadata = apply_initialization(
+                    released_numpy,
+                    record,
+                    candidate_index,
+                    self.config["initialization"],
+                )
+                q_initial = torch.as_tensor(
+                    effective_numpy, dtype=q_released.dtype, device=self.device
+                ).unsqueeze(0)
+                released_initial_q[candidate_index] = released_numpy
+                initial_q[candidate_index] = effective_numpy
+                proposal_metadata["candidate_seed"] = candidate_seed
+                initialization_metadata[candidate_index] = proposal_metadata
                 robot_pc = _batch_robot_point_cloud(
                     self.hand.get_transformed_links_pc(q_initial),
                     self.config["point_count"],
+                )
+                pre_network_rng_state_sha256[candidate_index] = torch_rng_state_digests(
+                    torch, self.device
                 )
                 torch.cuda.synchronize(self.device)
                 started = time.perf_counter()
@@ -404,7 +443,6 @@ class OfficialDROInference:
                 )
                 torch.cuda.synchronize(self.device)
                 timings[candidate_index] = time.perf_counter() - started
-                initial_q[candidate_index] = q_initial[0].detach().cpu().numpy()
                 stage_q[candidate_index] = torch.stack(
                     (q_outer[0], q_grasp_cpu[0], q_inner[0]), dim=0
                 ).numpy()
@@ -418,9 +456,12 @@ class OfficialDROInference:
                     }
                 )
         return {
+            "released_initial_q": released_initial_q,
             "initial_q": initial_q,
             "stage_q": stage_q,
             "timing_seconds": timings,
+            "initialization_metadata": initialization_metadata,
+            "pre_network_rng_state_sha256": pre_network_rng_state_sha256,
             "failures": failures,
         }
 
@@ -451,8 +492,11 @@ def _validate_inference_result(result: dict, candidate_count: int):
     if not isinstance(result, dict):
         raise ValueError("inference result must be a dictionary")
     stage_q = np.asarray(result["stage_q"], dtype=np.float32)
+    released_initial_q = np.asarray(result["released_initial_q"], dtype=np.float32)
     initial_q = np.asarray(result["initial_q"], dtype=np.float32)
     timings = np.asarray(result["timing_seconds"], dtype=np.float64)
+    initialization_metadata = list(result["initialization_metadata"])
+    pre_network_rng_state_sha256 = list(result["pre_network_rng_state_sha256"])
     candidate_failures = list(result.get("failures", []))
     failure_indices = []
     for failure in candidate_failures:
@@ -476,12 +520,16 @@ def _validate_inference_result(result: dict, candidate_count: int):
         len(DRO_SHADOW_Q_NAMES),
     )
     if (
-        initial_q.shape != expected_q_shape
+        released_initial_q.shape != expected_q_shape
+        or len(initialization_metadata) != candidate_count
+        or len(pre_network_rng_state_sha256) != candidate_count
+        or initial_q.shape != expected_q_shape
         or stage_q.shape != expected_stage_shape
         or timings.shape != (candidate_count,)
     ):
         raise ValueError(
             "inference result shape mismatch: "
+            f"released_initial_q={released_initial_q.shape}, "
             f"initial_q={initial_q.shape}, stage_q={stage_q.shape}, "
             f"timings={timings.shape}"
         )
@@ -489,12 +537,35 @@ def _validate_inference_result(result: dict, candidate_count: int):
         index for index in range(candidate_count) if index not in failure_indices
     ]
     if valid_indices and (
-        not np.isfinite(initial_q[valid_indices]).all()
+        not np.isfinite(released_initial_q[valid_indices]).all()
+        or not np.isfinite(initial_q[valid_indices]).all()
         or not np.isfinite(stage_q[valid_indices]).all()
         or not np.isfinite(timings[valid_indices]).all()
     ):
         raise ValueError("successful candidate inference result contains non-finite values")
-    return initial_q, stage_q, timings, candidate_failures, failure_indices
+    for candidate_index in valid_indices:
+        metadata = initialization_metadata[candidate_index]
+        rng_digests = pre_network_rng_state_sha256[candidate_index]
+        if (
+            not isinstance(metadata, dict)
+            or metadata.get("candidate_index") != candidate_index
+            or not isinstance(rng_digests, dict)
+            or not isinstance(rng_digests.get("cpu"), str)
+            or len(rng_digests["cpu"]) != 64
+        ):
+            raise ValueError(
+                f"successful candidate initialization evidence is invalid: {candidate_index}"
+            )
+    return (
+        released_initial_q,
+        initial_q,
+        stage_q,
+        timings,
+        initialization_metadata,
+        pre_network_rng_state_sha256,
+        candidate_failures,
+        failure_indices,
+    )
 
 
 def run(repo_root: Path, config: dict, inference=None) -> dict:
@@ -529,6 +600,7 @@ def run(repo_root: Path, config: dict, inference=None) -> dict:
         "shadow_urdf_sha256": sha256_file(Path(resolved["shadow_urdf"])),
         "shadow_point_cloud_sha256": sha256_file(Path(resolved["shadow_point_cloud"])),
         "resolved_config": resolved,
+        "initialization_mode": resolved["initialization"]["mode"],
         "scene_count": len(records),
         "source_scene_count": len(source_records),
         "source_scene_manifest_sha256": scene_manifest_sha256(source_records),
@@ -566,15 +638,23 @@ def run(repo_root: Path, config: dict, inference=None) -> dict:
             try:
                 result = inference(record, points, candidate_seeds)
                 (
+                    released_initial_q,
                     initial_q,
                     stage_q,
                     timings,
+                    initialization_metadata,
+                    pre_network_rng_state_sha256,
                     candidate_failures,
                     failure_indices,
                 ) = _validate_inference_result(
                     result, resolved["candidate_count"]
                 )
             except Exception as error:
+                released_initial_q = np.full(
+                    (resolved["candidate_count"], len(DRO_SHADOW_Q_NAMES)),
+                    np.nan,
+                    dtype=np.float32,
+                )
                 initial_q = np.full(
                     (resolved["candidate_count"], len(DRO_SHADOW_Q_NAMES)),
                     np.nan,
@@ -592,6 +672,8 @@ def run(repo_root: Path, config: dict, inference=None) -> dict:
                 timings = np.full(
                     (resolved["candidate_count"],), np.nan, dtype=np.float64
                 )
+                initialization_metadata = [None] * resolved["candidate_count"]
+                pre_network_rng_state_sha256 = [None] * resolved["candidate_count"]
                 candidate_failures = []
                 failure_indices = list(range(resolved["candidate_count"]))
                 scene_failure = {
@@ -611,7 +693,11 @@ def run(repo_root: Path, config: dict, inference=None) -> dict:
                 "point_seed": scene_point_seed,
                 "object_point_cloud": points,
                 "object_point_cloud_sha256": sha256_array(points),
+                "initialization_mode": resolved["initialization"]["mode"],
+                "released_initial_q": released_initial_q,
                 "initial_q": initial_q,
+                "initialization_metadata": initialization_metadata,
+                "pre_network_rng_state_sha256": pre_network_rng_state_sha256,
                 "stage_q": stage_q,
                 "timing_seconds": timings,
                 "failed_candidate_indices": failure_indices,
@@ -700,6 +786,100 @@ def run(repo_root: Path, config: dict, inference=None) -> dict:
         raise
 
 
+def _validate_v2_initialization_raw(
+    raw: dict,
+    record,
+    resolved: dict,
+    candidate_count: int,
+    *,
+    require_all: bool,
+) -> None:
+    """Validate persisted released/effective q and reproducible proposal evidence."""
+
+    resolved_initialization = resolved.get("initialization")
+    if not isinstance(resolved_initialization, dict):
+        raise ValueError(f"v2 run has no initialization config for {record.scene_id}")
+    mode = resolved_initialization.get("mode")
+    if mode not in INITIALIZATION_MODES or raw.get("initialization_mode") != mode:
+        raise ValueError(f"initialization mode mismatch for {record.scene_id}")
+    released_initial_q = np.asarray(raw.get("released_initial_q"))
+    initial_q = np.asarray(raw.get("initial_q"))
+    expected_shape = (candidate_count, len(DRO_SHADOW_Q_NAMES))
+    if released_initial_q.shape != expected_shape or initial_q.shape != expected_shape:
+        raise ValueError(f"initial q evidence shape mismatch for {record.scene_id}")
+    metadata_values = raw.get("initialization_metadata")
+    rng_values = raw.get("pre_network_rng_state_sha256")
+    candidate_seeds = raw.get("candidate_seeds")
+    if not all(
+        isinstance(value, list) and len(value) == candidate_count
+        for value in (metadata_values, rng_values, candidate_seeds)
+    ):
+        raise ValueError(f"initialization evidence length mismatch for {record.scene_id}")
+
+    for candidate_index in range(candidate_count):
+        metadata = metadata_values[candidate_index]
+        rng_digests = rng_values[candidate_index]
+        has_evidence = isinstance(metadata, dict) and isinstance(rng_digests, dict)
+        if require_all and not has_evidence:
+            raise ValueError(
+                f"missing initialization evidence for {record.scene_id}:{candidate_index}"
+            )
+        if not has_evidence:
+            continue
+        released_q = released_initial_q[candidate_index]
+        effective_q = initial_q[candidate_index]
+        if not np.isfinite(released_q).all() or not np.isfinite(effective_q).all():
+            raise ValueError(
+                f"non-finite initialization evidence for {record.scene_id}:{candidate_index}"
+            )
+        expected_q, expected_metadata = apply_initialization(
+            released_q, record, candidate_index, resolved_initialization
+        )
+        expected_metadata["candidate_seed"] = candidate_seeds[candidate_index]
+        if not np.array_equal(effective_q, expected_q):
+            raise ValueError(
+                f"effective initial q does not match mode for {record.scene_id}:{candidate_index}"
+            )
+        if metadata != expected_metadata:
+            raise ValueError(
+                f"proposal metadata mismatch for {record.scene_id}:{candidate_index}"
+            )
+        if metadata.get("candidate_seed") != candidate_seeds[candidate_index]:
+            raise ValueError(
+                f"candidate seed mismatch for {record.scene_id}:{candidate_index}"
+            )
+        cpu_digest = rng_digests.get("cpu")
+        if not isinstance(cpu_digest, str) or len(cpu_digest) != 64:
+            raise ValueError(
+                f"Torch RNG digest mismatch for {record.scene_id}:{candidate_index}"
+            )
+        try:
+            int(cpu_digest, 16)
+            cuda_digest = rng_digests.get("cuda")
+            if cuda_digest is not None:
+                if not isinstance(cuda_digest, str) or len(cuda_digest) != 64:
+                    raise ValueError
+                int(cuda_digest, 16)
+        except ValueError as error:
+            raise ValueError(
+                f"Torch RNG digest is not hexadecimal for "
+                f"{record.scene_id}:{candidate_index}"
+            ) from error
+        if mode == "released_random":
+            if not np.array_equal(released_q, effective_q):
+                raise ValueError(
+                    f"released_random changed q for {record.scene_id}:{candidate_index}"
+                )
+        elif not (
+            np.array_equal(released_q[:3], effective_q[:3])
+            and np.array_equal(released_q[6:], effective_q[6:])
+        ):
+            raise ValueError(
+                f"tabletop_stratified changed non-root-rotation q for "
+                f"{record.scene_id}:{candidate_index}"
+            )
+
+
 def validate_run_outputs(output_root: Path) -> dict:
     """Independently revalidate persisted raw/artifact pairs and accounting."""
 
@@ -708,8 +888,11 @@ def validate_run_outputs(output_root: Path) -> dict:
     failure_manifest = json.loads(
         (output_root / "failure_manifest.json").read_text(encoding="utf-8")
     )
-    if manifest.get("schema_version") != RUN_SCHEMA_VERSION:
+    run_schema_version = manifest.get("schema_version")
+    if run_schema_version not in SUPPORTED_RUN_SCHEMA_VERSIONS:
         raise ValueError("unsupported run manifest schema")
+    if failure_manifest.get("schema_version") != run_schema_version:
+        raise ValueError("failure manifest schema does not match run manifest")
     if manifest["candidate_count"] != (
         manifest["completed_candidate_count"] + manifest["failed_candidate_count"]
     ):
@@ -720,14 +903,25 @@ def validate_run_outputs(output_root: Path) -> dict:
         raise ValueError("failure manifest and scene statuses disagree")
 
     resolved = manifest["resolved_config"]
+    if run_schema_version == RUN_SCHEMA_VERSION:
+        initialization = resolved.get("initialization")
+        if (
+            not isinstance(initialization, dict)
+            or manifest.get("initialization_mode") != initialization.get("mode")
+        ):
+            raise ValueError("run manifest initialization mode does not match config")
     shadow_finger_joint_limits = load_dro_shadow_finger_joint_limits(
         Path(resolved["shadow_urdf"])
     )
-    source_records, selected_records = resolve_scene_records(resolved)
+    source_records, selected_records = resolve_scene_records(
+        resolved,
+        include_table_in_manifest=(run_schema_version != LEGACY_RUN_SCHEMA_VERSION),
+    )
     if manifest.get("source_scene_count") != len(source_records):
         raise ValueError("persisted source scene count does not match current inputs")
     if manifest.get("source_scene_manifest_sha256") != scene_manifest_sha256(
-        source_records
+        source_records,
+        include_table=(run_schema_version != LEGACY_RUN_SCHEMA_VERSION),
     ):
         raise ValueError("persisted source scene manifest does not match current inputs")
     if manifest.get("source_scale_histogram") != scene_scale_histogram(source_records):
@@ -751,7 +945,12 @@ def validate_run_outputs(output_root: Path) -> dict:
             grasp_path = output_root / scene["grasp_artifact"]
             raw = np.load(raw_path, allow_pickle=True).item()
             artifact = np.load(grasp_path, allow_pickle=True).item()
-            if raw.get("schema_version") != RAW_SCHEMA_VERSION:
+            expected_raw_schema = (
+                LEGACY_RAW_SCHEMA_VERSION
+                if run_schema_version == LEGACY_RUN_SCHEMA_VERSION
+                else RAW_SCHEMA_VERSION
+            )
+            if raw.get("schema_version") != expected_raw_schema:
                 raise ValueError(f"unsupported raw schema for {record.scene_id}")
             if raw.get("stage_names") != list(STAGE_NAMES):
                 raise ValueError(f"stage order mismatch for {record.scene_id}")
@@ -785,6 +984,14 @@ def validate_run_outputs(output_root: Path) -> dict:
             timings = np.asarray(raw.get("timing_seconds"))
             if initial_q.shape != (candidate_count, len(DRO_SHADOW_Q_NAMES)):
                 raise ValueError(f"initial q shape mismatch for {record.scene_id}")
+            if not np.isfinite(initial_q).all():
+                raise ValueError(f"initial q contains non-finite values for {record.scene_id}")
+            if run_schema_version == RUN_SCHEMA_VERSION:
+                if raw.get("scene") != record.to_manifest():
+                    raise ValueError(f"table scene provenance mismatch for {record.scene_id}")
+                _validate_v2_initialization_raw(
+                    raw, record, resolved, candidate_count, require_all=True
+                )
             if timings.shape != (candidate_count,) or not np.isfinite(timings).all():
                 raise ValueError(f"timing contract mismatch for {record.scene_id}")
             if raw.get("failed_candidate_indices") != []:
@@ -809,8 +1016,19 @@ def validate_run_outputs(output_root: Path) -> dict:
         elif scene["status"] == "failed":
             failed_raw_path = output_root / scene["failed_raw_artifact"]
             raw = np.load(failed_raw_path, allow_pickle=True).item()
-            if raw.get("schema_version") != RAW_SCHEMA_VERSION or "scene_failure" not in raw:
+            expected_raw_schema = (
+                LEGACY_RAW_SCHEMA_VERSION
+                if run_schema_version == LEGACY_RUN_SCHEMA_VERSION
+                else RAW_SCHEMA_VERSION
+            )
+            if raw.get("schema_version") != expected_raw_schema or "scene_failure" not in raw:
                 raise ValueError(f"failed raw diagnostics are incomplete for {record.scene_id}")
+            if run_schema_version == RUN_SCHEMA_VERSION:
+                if raw.get("scene") != record.to_manifest():
+                    raise ValueError(f"table scene provenance mismatch for {record.scene_id}")
+                _validate_v2_initialization_raw(
+                    raw, record, resolved, candidate_count, require_all=False
+                )
             failed_scenes += 1
         else:
             raise ValueError(f"unknown scene status for {record.scene_id}: {scene['status']}")

@@ -14,9 +14,12 @@ import numpy as np
 from .contracts import (
     BENCH_SHADOW_JOINT_NAMES,
     DRO_SHADOW_Q_NAMES,
+    LEGACY_RAW_SCHEMA_VERSION,
+    LEGACY_RUN_SCHEMA_VERSION,
     RAW_SCHEMA_VERSION,
     RUN_SCHEMA_VERSION,
     STAGE_NAMES,
+    SUPPORTED_RUN_SCHEMA_VERSIONS,
     clamp_dro_shadow_export_stages,
     dro_q_to_bench_pose,
     load_dro_shadow_finger_joint_limits,
@@ -442,7 +445,7 @@ class ShadowHandModel:
 
 
 class ViewerRun:
-    """Read-only index and validator for one #24 synthesis output root."""
+    """Read-only index and validator for one DRO DGN2k synthesis output root."""
 
     def __init__(
         self,
@@ -465,10 +468,11 @@ class ViewerRun:
             self.failure_manifest_path, "failure manifest"
         )
 
-        if self.manifest.get("schema_version") != RUN_SCHEMA_VERSION:
+        self.run_schema_version = self.manifest.get("schema_version")
+        if self.run_schema_version not in SUPPORTED_RUN_SCHEMA_VERSIONS:
             raise ValueError("unsupported run manifest schema")
-        if failure_manifest.get("schema_version") != RUN_SCHEMA_VERSION:
-            raise ValueError("unsupported failure manifest schema")
+        if failure_manifest.get("schema_version") != self.run_schema_version:
+            raise ValueError("failure manifest schema does not match run manifest")
         if self.manifest.get("status") not in {
             "completed",
             "completed_with_failures",
@@ -477,6 +481,14 @@ class ViewerRun:
             raise ValueError("run manifest is not in a terminal state")
         if self.manifest.get("resolved_config") != self.resolved_config:
             raise ValueError("run_manifest resolved_config does not match resolved_config.json")
+        if self.run_schema_version == RUN_SCHEMA_VERSION:
+            initialization = self.resolved_config.get("initialization")
+            if (
+                not isinstance(initialization, dict)
+                or self.manifest.get("initialization_mode")
+                != initialization.get("mode")
+            ):
+                raise ValueError("run manifest initialization mode does not match config")
         failures = failure_manifest.get("failures")
         if not isinstance(failures, list) or not all(
             isinstance(item, dict) for item in failures
@@ -663,6 +675,22 @@ class ViewerRun:
                 raise ValueError(
                     f"{source_name} object_pose_wxyz mismatch for {entry.scene_id}"
                 )
+        if self.run_schema_version == RUN_SCHEMA_VERSION:
+            for source_name, source in (
+                ("run manifest", manifest_scene),
+                ("raw scene", raw_scene),
+            ):
+                for key in (
+                    "table_type",
+                    "table_pose_wxyz",
+                    "table_normal_local",
+                    "table_normal_world",
+                    "table_origin_world",
+                ):
+                    if source.get(key) != expected[key]:
+                        raise ValueError(
+                            f"{source_name} {key} mismatch for {entry.scene_id}"
+                        )
 
     def load_scene(self, scene_id: str) -> LoadedScene:
         """Load and independently validate one completed scene without writing."""
@@ -690,13 +718,28 @@ class ViewerRun:
         )
         raw = _load_numpy_dict(raw_path, "raw artifact")
         artifact = _load_numpy_dict(artifact_path, "grasp artifact")
-        if raw.get("schema_version") != RAW_SCHEMA_VERSION:
+        expected_raw_schema = (
+            LEGACY_RAW_SCHEMA_VERSION
+            if self.run_schema_version == LEGACY_RUN_SCHEMA_VERSION
+            else RAW_SCHEMA_VERSION
+        )
+        if raw.get("schema_version") != expected_raw_schema:
             raise ValueError(f"unsupported raw schema for {scene_id}")
         if raw.get("stage_names") != list(STAGE_NAMES):
             raise ValueError(f"stage order mismatch for {scene_id}")
         if raw.get("dro_q_names") != list(DRO_SHADOW_Q_NAMES):
             raise ValueError(f"DRO q order mismatch for {scene_id}")
         self._validate_scene_provenance(entry, record, raw)
+        if self.run_schema_version == RUN_SCHEMA_VERSION:
+            from .runner import _validate_v2_initialization_raw
+
+            _validate_v2_initialization_raw(
+                raw,
+                record,
+                self.resolved_config,
+                self.candidate_count,
+                require_all=True,
+            )
 
         points = np.asarray(raw.get("object_point_cloud"))
         if points.shape != (512, 3) or points.dtype != np.float32:

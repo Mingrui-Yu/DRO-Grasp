@@ -12,9 +12,12 @@ from typing import Optional
 
 import numpy as np
 
-
-RAW_SCHEMA_VERSION = "drograsp.dgn2k.raw.v1"
-RUN_SCHEMA_VERSION = "drograsp.dgn2k.run.v1"
+LEGACY_RAW_SCHEMA_VERSION = "drograsp.dgn2k.raw.v1"
+LEGACY_RUN_SCHEMA_VERSION = "drograsp.dgn2k.run.v1"
+RAW_SCHEMA_VERSION = "drograsp.dgn2k.raw.v2"
+RUN_SCHEMA_VERSION = "drograsp.dgn2k.run.v2"
+SUPPORTED_RAW_SCHEMA_VERSIONS = (LEGACY_RAW_SCHEMA_VERSION, RAW_SCHEMA_VERSION)
+SUPPORTED_RUN_SCHEMA_VERSIONS = (LEGACY_RUN_SCHEMA_VERSION, RUN_SCHEMA_VERSION)
 STORED_SCENE_PREFIX = "src/curobo/content/assets/object/DGN_2k/scene_cfg"
 STAGE_NAMES = ("pregrasp", "grasp", "squeeze")
 
@@ -83,13 +86,17 @@ class SceneRecord:
     mesh_path: Path
     scale: float
     object_pose_wxyz: np.ndarray
+    table_pose_wxyz: np.ndarray
+    table_normal_local: np.ndarray
+    table_normal_world: np.ndarray
+    table_origin_world: np.ndarray
     scene_sha256: str
     mesh_sha256: str
 
-    def to_manifest(self) -> dict:
+    def to_manifest(self, *, include_table: bool = True) -> dict:
         """Return JSON-compatible scene provenance."""
 
-        return {
+        manifest = {
             "scene_id": self.scene_id,
             "stored_scene_path": self.stored_scene_path,
             "scene_sha256": self.scene_sha256,
@@ -99,6 +106,17 @@ class SceneRecord:
             "scale": self.scale,
             "object_pose_wxyz": self.object_pose_wxyz.tolist(),
         }
+        if include_table:
+            manifest.update(
+                {
+                    "table_type": "plane",
+                    "table_pose_wxyz": self.table_pose_wxyz.tolist(),
+                    "table_normal_local": self.table_normal_local.tolist(),
+                    "table_normal_world": self.table_normal_world.tolist(),
+                    "table_origin_world": self.table_origin_world.tolist(),
+                }
+            )
+        return manifest
 
 
 def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
@@ -122,11 +140,13 @@ def sha256_array(value: np.ndarray) -> str:
     return digest.hexdigest()
 
 
-def scene_manifest_sha256(records: list[SceneRecord]) -> str:
+def scene_manifest_sha256(
+    records: list[SceneRecord], *, include_table: bool = True
+) -> str:
     """Hash the ordered scene/asset provenance used by an experiment."""
 
     payload = json.dumps(
-        [record.to_manifest() for record in records],
+        [record.to_manifest(include_table=include_table) for record in records],
         ensure_ascii=True,
         sort_keys=True,
         separators=(",", ":"),
@@ -207,6 +227,32 @@ def load_scene_record(
     if not np.isclose(quaternion_norm, 1.0, rtol=0.0, atol=1e-5):
         raise ValueError(f"object quaternion is not normalized: {scene_path}")
 
+    table_config = objects.get("table") if isinstance(objects, dict) else None
+    if not isinstance(table_config, dict) or table_config.get("type") != "plane":
+        raise ValueError(f"scene table must be an explicit plane: {scene_path}")
+    table_pose = np.asarray(table_config.get("pose"), dtype=np.float64).reshape(-1)
+    if table_pose.shape != (7,) or not np.isfinite(table_pose).all():
+        raise ValueError(
+            f"table pose must be finite [xyz, qw, qx, qy, qz]: {scene_path}"
+        )
+    table_quaternion_norm = np.linalg.norm(table_pose[3:])
+    if not np.isclose(table_quaternion_norm, 1.0, rtol=0.0, atol=1e-5):
+        raise ValueError(f"table quaternion is not normalized: {scene_path}")
+    table_normal_local = np.asarray(
+        table_config.get("size"), dtype=np.float64
+    ).reshape(-1)
+    if (
+        table_normal_local.shape != (3,)
+        or not np.isfinite(table_normal_local).all()
+        or np.linalg.norm(table_normal_local) <= 0.0
+    ):
+        raise ValueError(f"table plane normal must be a finite non-zero vector: {scene_path}")
+    table_normal_local = table_normal_local / np.linalg.norm(table_normal_local)
+    table_normal_world = (
+        quaternion_wxyz_to_matrix(table_pose[3:]) @ table_normal_local
+    )
+    table_normal_world /= np.linalg.norm(table_normal_world)
+
     return SceneRecord(
         scene_id=scene_id,
         scene_path=scene_path,
@@ -215,6 +261,10 @@ def load_scene_record(
         mesh_path=mesh_path,
         scale=float(scale[0]),
         object_pose_wxyz=pose.copy(),
+        table_pose_wxyz=table_pose.copy(),
+        table_normal_local=table_normal_local.copy(),
+        table_normal_world=table_normal_world.copy(),
+        table_origin_world=table_pose[:3].copy(),
         scene_sha256=sha256_file(scene_path),
         mesh_sha256=sha256_file(mesh_path),
     )

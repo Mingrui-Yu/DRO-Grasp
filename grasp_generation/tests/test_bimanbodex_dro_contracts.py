@@ -10,8 +10,8 @@ import numpy as np
 
 from grasp_generation.experiments.bimanbodex_dro.contracts import (
     BENCH_SHADOW_JOINT_NAMES,
-    DRO_SHADOW_Q_NAMES,
     DRO_SHADOW_FINGER_JOINT_NAMES,
+    DRO_SHADOW_Q_NAMES,
     STAGE_NAMES,
     clamp_dro_shadow_export_stages,
     dro_q_to_bench_pose,
@@ -48,7 +48,12 @@ class ContractTests(unittest.TestCase):
                     "file_path": "../../../processed_data/object_a/mesh/simplified.obj",
                     "scale": np.array([0.133, 0.133, 0.133]),
                     "pose": np.array([0.2, -0.1, 0.3, 1.000001, 0.0, 0.0, 0.0]),
-                }
+                },
+                "table": {
+                    "type": "plane",
+                    "pose": np.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]),
+                    "size": np.array([0.0, 0.0, 1.0]),
+                },
             },
         }
         np.save(self.scene_path, config, allow_pickle=True)
@@ -68,6 +73,24 @@ class ContractTests(unittest.TestCase):
             atol=0.0,
         )
         self.assertTrue(self.record.stored_scene_path.endswith("object_a/floating/scale013.npy"))
+        np.testing.assert_array_equal(self.record.table_normal_world, [0.0, 0.0, 1.0])
+        self.assertEqual(self.record.to_manifest()["table_type"], "plane")
+
+    def test_scene_loader_rejects_missing_or_invalid_explicit_table(self):
+        value = np.load(self.scene_path, allow_pickle=True).item()
+        del value["scene"]["table"]
+        np.save(self.scene_path, value, allow_pickle=True)
+        with self.assertRaisesRegex(ValueError, "explicit plane"):
+            load_scene_record(self.scene_path, self.scene_root)
+
+        value["scene"]["table"] = {
+            "type": "plane",
+            "pose": np.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]),
+            "size": np.zeros(3),
+        }
+        np.save(self.scene_path, value, allow_pickle=True)
+        with self.assertRaisesRegex(ValueError, "non-zero vector"):
+            load_scene_record(self.scene_path, self.scene_root)
 
     def test_complete_surface_sampling_is_deterministic_scaled_and_not_recentered(self):
         first = sample_scaled_surface(self.mesh_path, 0.2, 512, 7)
