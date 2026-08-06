@@ -11,6 +11,7 @@ import numpy as np
 
 from grasp_generation.experiments.bimanbodex_dro.contracts import DRO_SHADOW_Q_NAMES
 from grasp_generation.experiments.bimanbodex_dro.runner import (
+    _batch_robot_point_cloud,
     dry_run,
     run,
     validate_run_outputs,
@@ -79,6 +80,15 @@ class RunnerTests(unittest.TestCase):
 
     def tearDown(self):
         self.temporary.cleanup()
+
+    def test_released_robot_point_cloud_gets_explicit_network_batch(self):
+        released = np.zeros((512, 4), dtype=np.float32)
+        released[:, 3] = 7.0
+        batched = _batch_robot_point_cloud(released, 512)
+        self.assertEqual(batched.shape, (1, 512, 3))
+        self.assertEqual(batched.dtype, np.float32)
+        with self.assertRaisesRegex(ValueError, "must have shape"):
+            _batch_robot_point_cloud(released[None], 512)
 
     @staticmethod
     def successful_inference(record, points, candidate_seeds):

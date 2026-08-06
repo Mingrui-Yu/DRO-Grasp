@@ -85,6 +85,18 @@ def _stable_seed(base_seed: int, namespace: str) -> int:
     return (int(base_seed) + int(digest[:8], 16)) % (2**31 - 1)
 
 
+def _batch_robot_point_cloud(robot_pc, point_count: int):
+    """Convert the released hand point cloud to one network input batch."""
+
+    expected_shape = (point_count, 4)
+    if tuple(robot_pc.shape) != expected_shape:
+        raise ValueError(
+            f"released robot point cloud must have shape {expected_shape}, "
+            f"got {tuple(robot_pc.shape)}"
+        )
+    return robot_pc[None, :, :3]
+
+
 def _resolve_path(repo_root: Path, value, *, required: bool = True):
     if value is None:
         if required:
@@ -349,7 +361,10 @@ class OfficialDROInference:
                 torch.manual_seed(candidate_seed)
                 torch.cuda.manual_seed_all(candidate_seed)
                 q_initial = self.hand.get_initial_q().unsqueeze(0).to(self.device)
-                robot_pc = self.hand.get_transformed_links_pc(q_initial)[..., :3]
+                robot_pc = _batch_robot_point_cloud(
+                    self.hand.get_transformed_links_pc(q_initial),
+                    self.config["point_count"],
+                )
                 torch.cuda.synchronize(self.device)
                 started = time.perf_counter()
                 with torch.no_grad():
