@@ -8,10 +8,12 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+import torch
 
 from grasp_generation.experiments.bimanbodex_dro.contracts import DRO_SHADOW_Q_NAMES
 from grasp_generation.experiments.bimanbodex_dro.runner import (
     _batch_robot_point_cloud,
+    _controller_stages_on_cpu,
     dry_run,
     run,
     validate_run_outputs,
@@ -89,6 +91,24 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(batched.dtype, np.float32)
         with self.assertRaisesRegex(ValueError, "must have shape"):
             _batch_robot_point_cloud(released[None], 512)
+
+    def test_released_controller_runs_on_cpu_and_preserves_stage_shapes(self):
+        observed = {}
+
+        def fake_controller(robot_name, q_grasp):
+            observed["robot_name"] = robot_name
+            observed["device"] = q_grasp.device.type
+            return q_grasp - 1.0, q_grasp + 1.0
+
+        q_grasp = torch.zeros((1, len(DRO_SHADOW_Q_NAMES)))
+        q_outer, q_center, q_inner = _controller_stages_on_cpu(
+            fake_controller, q_grasp
+        )
+        self.assertEqual(observed, {"robot_name": "shadowhand", "device": "cpu"})
+        self.assertEqual(q_outer.shape, q_center.shape)
+        self.assertEqual(q_inner.shape, q_center.shape)
+        torch.testing.assert_close(q_outer, q_center - 1.0)
+        torch.testing.assert_close(q_inner, q_center + 1.0)
 
     @staticmethod
     def successful_inference(record, points, candidate_seeds):

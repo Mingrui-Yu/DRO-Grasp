@@ -97,6 +97,17 @@ def _batch_robot_point_cloud(robot_pc, point_count: int):
     return robot_pc[None, :, :3]
 
 
+def _controller_stages_on_cpu(controller, q_grasp):
+    """Run the released controller with its CPU tensor assumptions."""
+
+    q_grasp_cpu = q_grasp.detach().cpu()
+    q_outer, q_inner = controller("shadowhand", q_grasp_cpu)
+    expected_shape = tuple(q_grasp_cpu.shape)
+    if tuple(q_outer.shape) != expected_shape or tuple(q_inner.shape) != expected_shape:
+        raise ValueError("released controller returned an unexpected q shape")
+    return q_outer, q_grasp_cpu, q_inner
+
+
 def _resolve_path(repo_root: Path, value, *, required: bool = True):
     if value is None:
         if required:
@@ -380,13 +391,15 @@ class OfficialDROInference:
                     optim_transform,
                     n_iter=self.config["n_iter"],
                 )
-                q_outer, q_inner = controller("shadowhand", q_grasp)
+                q_outer, q_grasp_cpu, q_inner = _controller_stages_on_cpu(
+                    controller, q_grasp
+                )
                 torch.cuda.synchronize(self.device)
                 timings[candidate_index] = time.perf_counter() - started
                 initial_q[candidate_index] = q_initial[0].detach().cpu().numpy()
                 stage_q[candidate_index] = torch.stack(
-                    (q_outer[0], q_grasp[0], q_inner[0]), dim=0
-                ).detach().cpu().numpy()
+                    (q_outer[0], q_grasp_cpu[0], q_inner[0]), dim=0
+                ).numpy()
             except Exception as error:  # Candidate failures are evidence, not silent drops.
                 failures.append(
                     {
