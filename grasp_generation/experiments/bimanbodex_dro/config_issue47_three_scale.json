@@ -51,7 +51,7 @@
   },
   "production": {
     "mode": "tabletop_filtered",
-    "batch_size": 20,
+    "batch_size": 100,
     "target_count": 20,
     "max_batches": 5,
     "selection_seed": 240826,
