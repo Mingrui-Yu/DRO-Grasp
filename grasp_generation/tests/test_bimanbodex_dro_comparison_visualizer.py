@@ -89,6 +89,9 @@ class _FakeServer:
 class _FakeRun:
     candidate_count = 20
 
+    def candidate_count_for_scene(self, _scene_id):
+        return self.candidate_count
+
     def __init__(self):
         self.calls = []
 

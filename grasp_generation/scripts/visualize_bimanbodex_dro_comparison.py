@@ -346,11 +346,22 @@ class ComparisonViewerApp:
         self.args = args
         self.scene_ids = tuple(args.scene)
         initial_candidates = _normalize_candidates(args.candidate, len(self.scene_ids))
+        for scene_id, candidate_index in zip(self.scene_ids, initial_candidates):
+            candidate_count = run.candidate_count_for_scene(scene_id)
+            if candidate_count == 0:
+                raise ValueError(
+                    f"comparison scene {scene_id} completed with zero renderable grasps"
+                )
+            if not 0 <= candidate_index < candidate_count:
+                raise ValueError(
+                    f"candidate index must be in [0,{candidate_count - 1}] "
+                    f"for {scene_id}, got {candidate_index}"
+                )
         self.candidates = tuple(
             server.gui.add_slider(
                 f"{PANEL_NAMES[index]} candidate",
                 min=0,
-                max=run.candidate_count - 1,
+                max=run.candidate_count_for_scene(self.scene_ids[index]) - 1,
                 step=1,
                 initial_value=value,
             )

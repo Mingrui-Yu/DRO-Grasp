@@ -16,17 +16,27 @@ LEGACY_RAW_SCHEMA_VERSION = "drograsp.dgn2k.raw.v1"
 LEGACY_RUN_SCHEMA_VERSION = "drograsp.dgn2k.run.v1"
 RAW_SCHEMA_VERSION = "drograsp.dgn2k.raw.v2"
 RUN_SCHEMA_VERSION = "drograsp.dgn2k.run.v2"
-FILTERED_RAW_SCHEMA_VERSION = "drograsp.dgn2k.raw.v3"
-FILTERED_RUN_SCHEMA_VERSION = "drograsp.dgn2k.run.v3"
+LEGACY_FILTERED_RAW_SCHEMA_VERSION = "drograsp.dgn2k.raw.v3"
+LEGACY_FILTERED_RUN_SCHEMA_VERSION = "drograsp.dgn2k.run.v3"
+FILTERED_RAW_SCHEMA_VERSION = "drograsp.dgn2k.raw.v4"
+FILTERED_RUN_SCHEMA_VERSION = "drograsp.dgn2k.run.v4"
+FILTERED_RAW_SCHEMA_VERSIONS = (
+    LEGACY_FILTERED_RAW_SCHEMA_VERSION,
+    FILTERED_RAW_SCHEMA_VERSION,
+)
+FILTERED_RUN_SCHEMA_VERSIONS = (
+    LEGACY_FILTERED_RUN_SCHEMA_VERSION,
+    FILTERED_RUN_SCHEMA_VERSION,
+)
 SUPPORTED_RAW_SCHEMA_VERSIONS = (
     LEGACY_RAW_SCHEMA_VERSION,
     RAW_SCHEMA_VERSION,
-    FILTERED_RAW_SCHEMA_VERSION,
+    *FILTERED_RAW_SCHEMA_VERSIONS,
 )
 SUPPORTED_RUN_SCHEMA_VERSIONS = (
     LEGACY_RUN_SCHEMA_VERSION,
     RUN_SCHEMA_VERSION,
-    FILTERED_RUN_SCHEMA_VERSION,
+    *FILTERED_RUN_SCHEMA_VERSIONS,
 )
 STORED_SCENE_PREFIX = "src/curobo/content/assets/object/DGN_2k/scene_cfg"
 STAGE_NAMES = ("pregrasp", "grasp", "squeeze")
@@ -538,6 +548,8 @@ def legacy_dro_stage_q_to_object_palm_transforms(stage_q: np.ndarray) -> np.ndar
         )
     if not np.isfinite(q).all():
         raise ValueError("DRO stage q contains non-finite values")
+    if q.shape[0] == 0:
+        return np.empty(q.shape[:-1] + (4, 4), dtype=np.float64)
     transforms = np.empty(q.shape[:-1] + (4, 4), dtype=np.float64)
     for candidate_index in range(q.shape[0]):
         for stage_index in range(q.shape[1]):
@@ -600,6 +612,8 @@ def dro_stage_q_to_object_palm_transforms(pk_chain, stage_q: np.ndarray) -> np.n
         )
     if "palm" not in pk_chain.get_link_names():
         raise ValueError("DRO PK chain has no palm link")
+    if q.shape[0] == 0:
+        return np.empty(q.shape[:-1] + (4, 4), dtype=np.float64)
 
     flat_q = q.reshape(-1, q.shape[-1])
     tensor_q = torch.as_tensor(

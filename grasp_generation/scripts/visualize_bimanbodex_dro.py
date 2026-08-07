@@ -99,10 +99,12 @@ def _initial_scene(run: ViewerRun, scene_id, scale):
                 f"{entry.scene_id}: {failure.get('stage', 'unknown')}"
                 + (f" ({message})" if message else "")
             )
+        empty = [entry.scene_id for entry in run.empty_scenes[:3]]
         raise ValueError(
-            "output root has no completed scenes"
+            "output root has no renderable completed scenes"
             + (f" at scale {scale:.9g}" if scale is not None else "")
             + (f"; failed scenes: {'; '.join(failures)}" if failures else "")
+            + (f"; empty completed scenes: {'; '.join(empty)}" if empty else "")
         )
     if scene_id is None:
         return choices[0]
@@ -136,10 +138,16 @@ class ViewerApp:
             options=list(run.scene_ids_for_scale(args.scale)),
             initial_value=initial_scene,
         )
+        initial_candidate_count = run.candidate_count_for_scene(initial_scene)
+        if not 0 <= args.candidate < initial_candidate_count:
+            raise ValueError(
+                f"candidate index must be in [0,{initial_candidate_count - 1}] "
+                f"for {initial_scene}, got {args.candidate}"
+            )
         self.candidate = server.gui.add_slider(
             "Candidate",
             min=0,
-            max=run.candidate_count - 1,
+            max=initial_candidate_count - 1,
             step=1,
             initial_value=args.candidate,
         )
@@ -183,8 +191,8 @@ class ViewerApp:
         self.diagnostics = server.gui.add_markdown("Loading selection...")
 
         self.scale.on_update(lambda _: self._on_scale())
+        self.scene.on_update(lambda _: self._on_scene())
         for handle in (
-            self.scene,
             self.candidate,
             self.stage,
             self.mode,
@@ -200,6 +208,22 @@ class ViewerApp:
             self.point_cloud,
         ):
             handle.on_update(lambda _: self.render())
+        self.render()
+
+    def _sync_candidate(self):
+        candidate_count = self.run.candidate_count_for_scene(self.scene.value)
+        self.candidate.max = candidate_count - 1
+        if int(self.candidate.value) >= candidate_count:
+            self.candidate.value = candidate_count - 1
+
+    def _on_scene(self):
+        if self._updating:
+            return
+        self._updating = True
+        try:
+            self._sync_candidate()
+        finally:
+            self._updating = False
         self.render()
 
     def _clear_scene(self):
@@ -220,6 +244,7 @@ class ViewerApp:
             self.scene.options = choices
             if self.scene.value not in choices:
                 self.scene.value = choices[0]
+            self._sync_candidate()
         finally:
             self._updating = False
         self.render()

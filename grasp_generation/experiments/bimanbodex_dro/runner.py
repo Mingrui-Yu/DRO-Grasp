@@ -18,7 +18,10 @@ import numpy as np
 from .contracts import (
     DRO_SHADOW_Q_NAMES,
     FILTERED_RAW_SCHEMA_VERSION,
+    FILTERED_RUN_SCHEMA_VERSIONS,
     FILTERED_RUN_SCHEMA_VERSION,
+    LEGACY_FILTERED_RAW_SCHEMA_VERSION,
+    LEGACY_FILTERED_RUN_SCHEMA_VERSION,
     LEGACY_RAW_SCHEMA_VERSION,
     LEGACY_RUN_SCHEMA_VERSION,
     RAW_SCHEMA_VERSION,
@@ -245,8 +248,16 @@ def _resolve_production_config(value, candidate_count: int) -> dict:
         raise ValueError("production table_margin must remain exactly 0")
 
     if resolved["mode"] == "tabletop_filtered":
+        if resolved["batch_size"] != 100:
+            raise ValueError(
+                "tabletop_filtered production batch_size must remain exactly 100"
+            )
         if max_batches is None:
             raise ValueError("tabletop_filtered production requires explicit max_batches")
+        if max_batches != 5:
+            raise ValueError(
+                "tabletop_filtered production max_batches must remain exactly 5"
+            )
         if selection_seed is None:
             raise ValueError("tabletop_filtered production requires explicit selection_seed")
     resolved["generation_group_size"] = candidate_count
@@ -798,7 +809,7 @@ def _run_tabletop_filtered_scene(
     collision_model: TabletopCollisionModel,
     progress_callback=None,
 ) -> tuple[dict | None, dict, dict | None, dict]:
-    """Generate/filter batches and return one selected 20-candidate scene."""
+    """Generate/filter full batches and return up to 20 valid candidates."""
 
     production = resolved["production"]
     group_size = production["generation_group_size"]
@@ -1053,6 +1064,7 @@ def _run_tabletop_filtered_scene(
         "batch_count": len(batch_summaries),
         "generated_candidate_count": generated_count,
         "valid_candidate_count": len(valid_generation_indices),
+        "requested_candidate_count": target_count,
         "table_rejected_candidate_count": sum(
             item["status"] == "table_rejected"
             for item in generation_filter_diagnostics
@@ -1067,24 +1079,22 @@ def _run_tabletop_filtered_scene(
 
     if fatal_failure is not None:
         return None, raw, fatal_failure, summary
-    if len(valid_generation_indices) < target_count:
-        scene_failure = {
-            "scene_id": record.scene_id,
-            "stage": "tabletop_filter_max_batches",
-            "max_batches": production["max_batches"],
-            "generated_candidate_count": generated_count,
-            "valid_candidate_count": len(valid_generation_indices),
-            "target_count": target_count,
-            "policy": resolved["failure_policy"],
-        }
-        return None, raw, scene_failure, summary
 
-    rng = np.random.default_rng(selection_seed)
-    selected_generation_indices = rng.choice(
-        np.asarray(valid_generation_indices, dtype=np.int64),
-        size=target_count,
-        replace=False,
-    ).tolist()
+    valid_count = len(valid_generation_indices)
+    returned_count = min(valid_count, target_count)
+    budget_exhausted = valid_count < target_count
+    result_kind = (
+        "full" if returned_count == target_count else "partial" if returned_count else "empty"
+    )
+    if valid_count > target_count:
+        rng = np.random.default_rng(selection_seed)
+        selected_generation_indices = rng.choice(
+            np.asarray(valid_generation_indices, dtype=np.int64),
+            size=target_count,
+            replace=False,
+        ).tolist()
+    else:
+        selected_generation_indices = list(valid_generation_indices)
     selected_sources = [generation_sources[index] for index in selected_generation_indices]
     selected_stage_q = generated["stage_q"][selected_generation_indices]
     export_started = time.perf_counter()
@@ -1111,7 +1121,7 @@ def _run_tabletop_filtered_scene(
         scene_failure = {
             "scene_id": record.scene_id,
             "stage": "export_validation",
-            "candidate_count": target_count,
+            "candidate_count": returned_count,
             "error_type": type(error).__name__,
             "message": str(error),
             "policy": resolved["failure_policy"],
@@ -1120,6 +1130,11 @@ def _run_tabletop_filtered_scene(
 
     raw.update(
         {
+            "result_kind": result_kind,
+            "requested_candidate_count": target_count,
+            "returned_candidate_count": returned_count,
+            "shortfall_candidate_count": target_count - returned_count,
+            "budget_exhausted": budget_exhausted,
             "selected_source_indices": selected_generation_indices,
             "selected_candidate_sources": selected_sources,
             "selected_proposal_indices": [
@@ -1149,13 +1164,21 @@ def _run_tabletop_filtered_scene(
             "export_seconds": time.perf_counter() - export_started,
         }
     )
-    summary["selected_source_indices"] = selected_generation_indices
-    summary["selected_candidate_sources"] = selected_sources
+    summary.update(
+        {
+            "result_kind": result_kind,
+            "returned_candidate_count": returned_count,
+            "shortfall_candidate_count": target_count - returned_count,
+            "budget_exhausted": budget_exhausted,
+            "selected_source_indices": selected_generation_indices,
+            "selected_candidate_sources": selected_sources,
+        }
+    )
     return artifact, raw, None, summary
 
 
 def run(repo_root: Path, config: dict, inference=None) -> dict:
-    """Run isolated inference and write only scene-atomic valid Bench artifacts."""
+    """Run isolated inference and write completed Bench artifacts per scene."""
 
     repo_root = Path(repo_root).resolve(strict=True)
     resolved = resolve_config(repo_root, config)
@@ -1220,10 +1243,18 @@ def run(repo_root: Path, config: dict, inference=None) -> dict:
         manifest.update(
             {
                 "tabletop_collision_model": collision_model.to_manifest(),
+                "requested_candidate_count": len(records)
+                * resolved["candidate_count"],
+                "returned_candidate_count": 0,
+                "shortfall_candidate_count": 0,
                 "generated_candidate_count": 0,
                 "table_collision_free_candidate_count": 0,
                 "table_rejected_candidate_count": 0,
                 "inference_failed_generation_candidate_count": 0,
+                "full_scene_count": 0,
+                "partial_scene_count": 0,
+                "empty_scene_count": 0,
+                "failed_scene_count": 0,
             }
         )
     failure_manifest = {"schema_version": run_schema_version, "failures": []}
@@ -1334,8 +1365,23 @@ def run(repo_root: Path, config: dict, inference=None) -> dict:
                 )
                 if scene_failure is None:
                     _write_scene_pair(grasp_path, raw_path, artifact, raw)
-                    manifest["completed_candidate_count"] += resolved["candidate_count"]
+                    returned_count = production_summary["returned_candidate_count"]
+                    shortfall_count = production_summary["shortfall_candidate_count"]
+                    result_kind = production_summary["result_kind"]
+                    manifest["completed_candidate_count"] += returned_count
+                    manifest["returned_candidate_count"] += returned_count
+                    manifest["shortfall_candidate_count"] += shortfall_count
+                    manifest[f"{result_kind}_scene_count"] += 1
                     scene_record["status"] = "completed"
+                    scene_record["result_kind"] = result_kind
+                    scene_record["requested_candidate_count"] = resolved[
+                        "candidate_count"
+                    ]
+                    scene_record["returned_candidate_count"] = returned_count
+                    scene_record["shortfall_candidate_count"] = shortfall_count
+                    scene_record["budget_exhausted"] = production_summary[
+                        "budget_exhausted"
+                    ]
                     scene_record["candidate_seeds"] = raw["candidate_seeds"]
                     scene_record["grasp_artifact"] = str(
                         grasp_path.relative_to(output_root)
@@ -1343,6 +1389,7 @@ def run(repo_root: Path, config: dict, inference=None) -> dict:
                     scene_record["raw_artifact"] = str(raw_path.relative_to(output_root))
                 else:
                     manifest["failed_candidate_count"] += resolved["candidate_count"]
+                    manifest["failed_scene_count"] += 1
                     scene_record["status"] = "failed"
                     failure_manifest["failures"].append(scene_failure)
                     raw["scene_failure"] = scene_failure
@@ -1508,16 +1555,33 @@ def run(repo_root: Path, config: dict, inference=None) -> dict:
             _atomic_json(output_root / "run_manifest.json", manifest)
             _atomic_json(output_root / "failure_manifest.json", failure_manifest)
 
-        if manifest["candidate_count"] != (
-            manifest["completed_candidate_count"] + manifest["failed_candidate_count"]
-        ):
-            raise RuntimeError("candidate denominator accounting is inconsistent")
-        if manifest["completed_candidate_count"] == manifest["candidate_count"]:
-            manifest["status"] = "completed"
-        elif manifest["completed_candidate_count"] == 0:
-            manifest["status"] = "failed"
+        if filtered_production:
+            if manifest["requested_candidate_count"] != (
+                manifest["returned_candidate_count"]
+                + manifest["shortfall_candidate_count"]
+                + manifest["failed_candidate_count"]
+            ):
+                raise RuntimeError("filtered candidate accounting is inconsistent")
+            if manifest["failed_scene_count"] == len(records):
+                manifest["status"] = "failed"
+            elif manifest["failed_scene_count"]:
+                manifest["status"] = "completed_with_failures"
+            elif manifest["shortfall_candidate_count"]:
+                manifest["status"] = "completed_with_shortfalls"
+            else:
+                manifest["status"] = "completed"
         else:
-            manifest["status"] = "completed_with_failures"
+            if manifest["candidate_count"] != (
+                manifest["completed_candidate_count"]
+                + manifest["failed_candidate_count"]
+            ):
+                raise RuntimeError("candidate denominator accounting is inconsistent")
+            if manifest["completed_candidate_count"] == manifest["candidate_count"]:
+                manifest["status"] = "completed"
+            elif manifest["completed_candidate_count"] == 0:
+                manifest["status"] = "failed"
+            else:
+                manifest["status"] = "completed_with_failures"
         manifest["completed_at"] = utc_now()
         manifest["output_bytes"] = sum(
             path.stat().st_size for path in output_root.rglob("*") if path.is_file()
@@ -1656,7 +1720,7 @@ def _validate_v2_initialization_raw(
             )
 
 
-def _validate_v3_filtered_raw(
+def _validate_filtered_raw(
     raw: dict,
     record,
     resolved: dict,
@@ -1667,7 +1731,9 @@ def _validate_v3_filtered_raw(
     shadow_finger_joint_limits: dict,
     require_selected: bool,
 ) -> None:
-    """Independently validate generated, filtered, and selected v3 provenance."""
+    """Validate legacy fixed-20 v3 or partial-success v4 filter provenance."""
+
+    partial_contract = raw.get("schema_version") == FILTERED_RAW_SCHEMA_VERSION
 
     production = resolved.get("production")
     if (
@@ -1904,19 +1970,47 @@ def _validate_v3_filtered_raw(
     if not require_selected:
         return
 
+    if partial_contract:
+        selected_count = min(len(valid_indices), candidate_count)
+        result_kind = (
+            "full"
+            if selected_count == candidate_count
+            else "partial"
+            if selected_count
+            else "empty"
+        )
+        expected_result_fields = {
+            "result_kind": result_kind,
+            "requested_candidate_count": candidate_count,
+            "returned_candidate_count": selected_count,
+            "shortfall_candidate_count": candidate_count - selected_count,
+            "budget_exhausted": selected_count < candidate_count,
+        }
+        if any(raw.get(key) != value for key, value in expected_result_fields.items()):
+            raise ValueError(f"partial result accounting mismatch for {record.scene_id}")
+        if selected_count < candidate_count and generated_count != (
+            production["batch_size"] * production["max_batches"]
+        ):
+            raise ValueError(f"partial result did not exhaust its budget for {record.scene_id}")
+    else:
+        selected_count = candidate_count
+
     selected_indices = raw.get("selected_source_indices")
     if (
         not isinstance(selected_indices, list)
-        or len(selected_indices) != candidate_count
-        or len(set(selected_indices)) != candidate_count
+        or len(selected_indices) != selected_count
+        or len(set(selected_indices)) != selected_count
         or any(index not in valid_indices for index in selected_indices)
     ):
         raise ValueError(f"selected source indices mismatch for {record.scene_id}")
-    expected_selected = np.random.default_rng(expected_selection_seed).choice(
-        np.asarray(valid_indices, dtype=np.int64),
-        size=candidate_count,
-        replace=False,
-    ).tolist()
+    if partial_contract and len(valid_indices) <= candidate_count:
+        expected_selected = list(valid_indices)
+    else:
+        expected_selected = np.random.default_rng(expected_selection_seed).choice(
+            np.asarray(valid_indices, dtype=np.int64),
+            size=selected_count,
+            replace=False,
+        ).tolist()
     if selected_indices != expected_selected:
         raise ValueError(f"random selection is not reproducible for {record.scene_id}")
     selected_sources = [sources[index] for index in selected_indices]
@@ -1950,7 +2044,7 @@ def _validate_v3_filtered_raw(
         raw,
         record,
         resolved,
-        candidate_count,
+        selected_count,
         require_all=True,
         proposal_indices=selected_proposals,
     )
@@ -1969,7 +2063,22 @@ def validate_run_outputs(output_root: Path) -> dict:
         raise ValueError("unsupported run manifest schema")
     if failure_manifest.get("schema_version") != run_schema_version:
         raise ValueError("failure manifest schema does not match run manifest")
-    if manifest["candidate_count"] != (
+    filtered_run = run_schema_version in FILTERED_RUN_SCHEMA_VERSIONS
+    partial_filtered_run = run_schema_version == FILTERED_RUN_SCHEMA_VERSION
+    if partial_filtered_run:
+        if manifest.get("requested_candidate_count") != (
+            manifest.get("returned_candidate_count", 0)
+            + manifest.get("shortfall_candidate_count", 0)
+            + manifest.get("failed_candidate_count", 0)
+        ):
+            raise ValueError("filtered candidate accounting is inconsistent")
+        if manifest.get("candidate_count") != manifest.get(
+            "requested_candidate_count"
+        ) or manifest.get("completed_candidate_count") != manifest.get(
+            "returned_candidate_count"
+        ):
+            raise ValueError("filtered compatibility counters are inconsistent")
+    elif manifest["candidate_count"] != (
         manifest["completed_candidate_count"] + manifest["failed_candidate_count"]
     ):
         raise ValueError("candidate denominator accounting is inconsistent")
@@ -1979,8 +2088,7 @@ def validate_run_outputs(output_root: Path) -> dict:
         raise ValueError("failure manifest and scene statuses disagree")
 
     resolved = manifest["resolved_config"]
-    filtered_run = run_schema_version == FILTERED_RUN_SCHEMA_VERSION
-    if run_schema_version in (RUN_SCHEMA_VERSION, FILTERED_RUN_SCHEMA_VERSION):
+    if run_schema_version == RUN_SCHEMA_VERSION or filtered_run:
         initialization = resolved.get("initialization")
         if (
             not isinstance(initialization, dict)
@@ -2042,6 +2150,9 @@ def validate_run_outputs(output_root: Path) -> dict:
     candidate_count = resolved["candidate_count"]
     completed_scenes = 0
     failed_scenes = 0
+    returned_candidate_count = 0
+    shortfall_candidate_count = 0
+    result_kind_counts = {"full": 0, "partial": 0, "empty": 0}
     generated_candidate_count = 0
     valid_generation_count = 0
     table_rejected_count = 0
@@ -2057,8 +2168,10 @@ def validate_run_outputs(output_root: Path) -> dict:
             expected_raw_schema = (
                 LEGACY_RAW_SCHEMA_VERSION
                 if run_schema_version == LEGACY_RUN_SCHEMA_VERSION
+                else LEGACY_FILTERED_RAW_SCHEMA_VERSION
+                if run_schema_version == LEGACY_FILTERED_RUN_SCHEMA_VERSION
                 else FILTERED_RAW_SCHEMA_VERSION
-                if filtered_run
+                if partial_filtered_run
                 else RAW_SCHEMA_VERSION
             )
             if raw.get("schema_version") != expected_raw_schema:
@@ -2074,8 +2187,19 @@ def validate_run_outputs(output_root: Path) -> dict:
                 raise ValueError(f"point-cloud contract mismatch for {record.scene_id}")
             if sha256_array(points) != raw.get("object_point_cloud_sha256"):
                 raise ValueError(f"point-cloud hash mismatch for {record.scene_id}")
+            selected_count = (
+                raw.get("returned_candidate_count")
+                if partial_filtered_run
+                else candidate_count
+            )
+            if (
+                not isinstance(selected_count, int)
+                or isinstance(selected_count, bool)
+                or not 0 <= selected_count <= candidate_count
+            ):
+                raise ValueError(f"returned candidate count mismatch for {record.scene_id}")
             stage_q = np.asarray(raw.get("stage_q"))
-            if stage_q.shape != (candidate_count, 3, len(DRO_SHADOW_Q_NAMES)):
+            if stage_q.shape != (selected_count, 3, len(DRO_SHADOW_Q_NAMES)):
                 raise ValueError(f"stage q shape mismatch for {record.scene_id}")
             if not np.isfinite(stage_q).all():
                 raise ValueError(f"stage q contains non-finite values for {record.scene_id}")
@@ -2095,15 +2219,15 @@ def validate_run_outputs(output_root: Path) -> dict:
                 raise ValueError(f"export clamp diagnostics mismatch for {record.scene_id}")
             initial_q = np.asarray(raw.get("initial_q"))
             timings = np.asarray(raw.get("timing_seconds"))
-            if initial_q.shape != (candidate_count, len(DRO_SHADOW_Q_NAMES)):
+            if initial_q.shape != (selected_count, len(DRO_SHADOW_Q_NAMES)):
                 raise ValueError(f"initial q shape mismatch for {record.scene_id}")
             if not np.isfinite(initial_q).all():
                 raise ValueError(f"initial q contains non-finite values for {record.scene_id}")
-            if run_schema_version in (RUN_SCHEMA_VERSION, FILTERED_RUN_SCHEMA_VERSION):
+            if run_schema_version == RUN_SCHEMA_VERSION or filtered_run:
                 if raw.get("scene") != record.to_manifest():
                     raise ValueError(f"table scene provenance mismatch for {record.scene_id}")
                 if filtered_run:
-                    _validate_v3_filtered_raw(
+                    _validate_filtered_raw(
                         raw,
                         record,
                         resolved,
@@ -2117,7 +2241,7 @@ def validate_run_outputs(output_root: Path) -> dict:
                     _validate_v2_initialization_raw(
                         raw, record, resolved, candidate_count, require_all=True
                     )
-            if timings.shape != (candidate_count,) or not np.isfinite(timings).all():
+            if timings.shape != (selected_count,) or not np.isfinite(timings).all():
                 raise ValueError(f"timing contract mismatch for {record.scene_id}")
             if raw.get("failed_candidate_indices") != []:
                 raise ValueError(f"completed scene records candidate failures: {record.scene_id}")
@@ -2167,6 +2291,22 @@ def validate_run_outputs(output_root: Path) -> dict:
                     item["status"] == "inference_failed"
                     for item in raw["generation_filter_diagnostics"]
                 )
+            if partial_filtered_run:
+                result_kind = raw.get("result_kind")
+                if result_kind not in result_kind_counts:
+                    raise ValueError(f"result kind mismatch for {record.scene_id}")
+                expected_scene_fields = {
+                    "result_kind": result_kind,
+                    "requested_candidate_count": candidate_count,
+                    "returned_candidate_count": selected_count,
+                    "shortfall_candidate_count": candidate_count - selected_count,
+                    "budget_exhausted": selected_count < candidate_count,
+                }
+                if any(scene.get(key) != value for key, value in expected_scene_fields.items()):
+                    raise ValueError(f"scene result accounting mismatch for {record.scene_id}")
+                returned_candidate_count += selected_count
+                shortfall_candidate_count += candidate_count - selected_count
+                result_kind_counts[result_kind] += 1
             completed_scenes += 1
         elif scene["status"] == "failed":
             failed_raw_path = output_root / scene["failed_raw_artifact"]
@@ -2174,19 +2314,21 @@ def validate_run_outputs(output_root: Path) -> dict:
             expected_raw_schema = (
                 LEGACY_RAW_SCHEMA_VERSION
                 if run_schema_version == LEGACY_RUN_SCHEMA_VERSION
+                else LEGACY_FILTERED_RAW_SCHEMA_VERSION
+                if run_schema_version == LEGACY_FILTERED_RUN_SCHEMA_VERSION
                 else FILTERED_RAW_SCHEMA_VERSION
-                if filtered_run
+                if partial_filtered_run
                 else RAW_SCHEMA_VERSION
             )
             if raw.get("schema_version") != expected_raw_schema or "scene_failure" not in raw:
                 raise ValueError(f"failed raw diagnostics are incomplete for {record.scene_id}")
             if persisted_palm_fk is not None and raw.get("palm_fk") != persisted_palm_fk:
                 raise ValueError(f"palm FK provenance mismatch for {record.scene_id}")
-            if run_schema_version in (RUN_SCHEMA_VERSION, FILTERED_RUN_SCHEMA_VERSION):
+            if run_schema_version == RUN_SCHEMA_VERSION or filtered_run:
                 if raw.get("scene") != record.to_manifest():
                     raise ValueError(f"table scene provenance mismatch for {record.scene_id}")
                 if filtered_run:
-                    _validate_v3_filtered_raw(
+                    _validate_filtered_raw(
                         raw,
                         record,
                         resolved,
@@ -2225,6 +2367,31 @@ def validate_run_outputs(output_root: Path) -> dict:
         }
         if any(manifest.get(key) != value for key, value in expected_counters.items()):
             raise ValueError("filtered run manifest generation accounting mismatch")
+        if partial_filtered_run:
+            partial_counters = {
+                "requested_candidate_count": len(selected_records) * candidate_count,
+                "returned_candidate_count": returned_candidate_count,
+                "completed_candidate_count": returned_candidate_count,
+                "shortfall_candidate_count": shortfall_candidate_count,
+                "failed_candidate_count": failed_scenes * candidate_count,
+                "full_scene_count": result_kind_counts["full"],
+                "partial_scene_count": result_kind_counts["partial"],
+                "empty_scene_count": result_kind_counts["empty"],
+                "failed_scene_count": failed_scenes,
+            }
+            if any(manifest.get(key) != value for key, value in partial_counters.items()):
+                raise ValueError("filtered run partial accounting mismatch")
+            expected_status = (
+                "failed"
+                if failed_scenes == len(selected_records)
+                else "completed_with_failures"
+                if failed_scenes
+                else "completed_with_shortfalls"
+                if shortfall_candidate_count
+                else "completed"
+            )
+            if manifest.get("status") != expected_status:
+                raise ValueError("filtered run terminal status mismatch")
     result = {
         "status": "valid",
         "scene_count": len(manifest["scenes"]),
@@ -2236,4 +2403,6 @@ def validate_run_outputs(output_root: Path) -> dict:
     }
     if filtered_run:
         result.update(expected_counters)
+    if partial_filtered_run:
+        result.update(partial_counters)
     return result

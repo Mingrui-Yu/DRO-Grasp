@@ -59,11 +59,11 @@ collision loss or execution-path check.
   root translation and `q[6:]` match for each paired candidate. The CPU and
   applicable CUDA Torch RNG-state digests are captured immediately before
   network forward to verify identical validation latent state.
-- Filtered production budget: `tabletop_filtered` generates complete batches
-  whose size is a positive multiple of the unchanged 20-slot initialization
-  group. Valid candidates accumulate across batches until at least 20 are
-  available or the explicit positive `max_batches` limit is reached. Therefore
-  `batch_size * max_batches` is the hard generated-candidate cap per scene.
+- Filtered production budget: `tabletop_filtered` generates complete batches of
+  100 candidates, implemented as five unchanged 20-slot initialization groups.
+  Valid candidates accumulate across batches until at least 20 are available or
+  five batches are complete. The hard generated-candidate cap is therefore 500
+  per scene.
 - Final-pose table filter: only the export-clamped `grasp_qpos` corresponding to
   `predict_q` is checked. The model parses the released URDF `collision`
   geometry and selects `palm` plus all kinematic descendants; `forearm`,
@@ -75,18 +75,23 @@ collision loss or execution-path check.
   drives uniform random sampling without replacement from all accumulated valid
   candidates. No score, top-k, quality weighting, diversity ranking, deduplication,
   or manual choice is used. Source batch/candidate/proposal indices and generation
-  and selection Seeds are persisted for every selected grasp.
-- Failure policy: baseline outputs remain scene-atomic under their original
-  20-candidate policy. Filtered production records individual inference failures
-  and continues accumulating other candidates; structural inference/filter/export
-  failures or reaching `max_batches` below 20 valid grasps fail the scene without
-  relaxing the filter, duplicating grasps, or writing a short artifact.
+  and selection Seeds are persisted for every selected grasp. If the 500-candidate
+  budget ends below the target, all valid candidates are retained in stable
+  generation order.
+- Partial-success policy: baseline outputs remain scene-atomic under their
+  original 20-candidate policy. Filtered production records individual inference
+  failures and continues accumulating other candidates. Structural scene,
+  inference, filter, FK, or export failures still fail the scene. Reaching the
+  500-candidate budget below 20 valid grasps is instead a normal `partial` or
+  `empty` result: every valid grasp is returned without relaxing the filter,
+  duplicating grasps, or padding the artifact.
 
-The Bench-facing artifact remains unchanged:
+The Bench-facing keys, joint order, and stage semantics remain unchanged, while
+the candidate axis becomes variable-length for filtered v4 outputs:
 
 ```python
 {
-    "robot_pose": np.ndarray,  # float32 [1, 20, 3, 29]
+    "robot_pose": np.ndarray,  # float32 [1, N, 3, 29], 0 <= N <= 20
     "joint_names": [...],      # Bench rh_* order
     "scene_path": ["src/curobo/content/assets/object/DGN_2k/scene_cfg/..."],
 }
@@ -106,11 +111,12 @@ explicit table contract, pre-network RNG digests, and `palm_fk` provenance
 (`backend`, link, joint order, URDF SHA256, dtype, and device). Validators and
 the viewer retain read-only support for #24 artifacts without `palm_fk` by
 using the old hand-written formula only as an explicit historical compatibility
-path; new writes always use actual PK FK. Filtered production uses
-`drograsp.dgn2k.raw.v3` / `drograsp.dgn2k.run.v3`: the canonical selected fields
-remain 20-candidate viewer/Bench-compatible arrays, while `generation_*`,
-`batch_summaries`, filter diagnostics, selection indices, and source provenance
-retain all generated candidates.
+path; new writes always use actual PK FK. Historical filtered production uses
+`drograsp.dgn2k.raw.v3` / `drograsp.dgn2k.run.v3` and remains read-only
+compatible. New partial-success production uses `drograsp.dgn2k.raw.v4` /
+`drograsp.dgn2k.run.v4`: selected fields use the persisted returned count `N`,
+while `generation_*`, `batch_summaries`, filter diagnostics, selection indices,
+shortfall accounting, and source provenance retain all generated candidates.
 
 ## Assets and environment
 
@@ -183,7 +189,7 @@ python grasp_generation/scripts/generate_bimanbodex_dro.py \
   --config grasp_generation/experiments/bimanbodex_dro/config.json \
   --initialization-mode tabletop_stratified \
   --production-mode tabletop_filtered \
-  --max-batches 10 \
+  --max-batches 5 \
   --selection-seed 240826 \
   --dry-run
 ```
@@ -211,7 +217,7 @@ DRO_PYTHON="${DRO_PYTHON:-../.conda-envs/dro/bin/python}"
   --config grasp_generation/experiments/bimanbodex_dro/config.json \
   --initialization-mode tabletop_stratified \
   --production-mode tabletop_filtered \
-  --max-batches 10 \
+  --max-batches 5 \
   --selection-seed 240826 \
   --max-scenes 1 \
   --output-root /path/to/new/issue42-tabletop-filtered-seed240826
@@ -342,9 +348,11 @@ The Issue #47 config resolves exactly three bottle-like DGN2k tabletop scenes:
 - `scale030`, persisted actual scale `0.30`.
 
 It intentionally clears `reference_grasp_roots`, uses the checked-in scene list,
-and pins the three-scene manifest hash. Its filtered budget is one 20-candidate
-initialization group per batch and at most five batches, so each scene stops as
-soon as 20 valid grasps exist and can never generate more than 100 candidates.
+and pins the three-scene manifest hash. Its filtered budget is 100 candidates
+per batch and at most five batches, so each scene stops after the first complete
+batch that reaches 20 valid grasps and can never generate more than 500
+candidates. A scene that remains below 20 returns all valid grasps, including an
+explicit zero-length artifact when no candidate passes.
 Per-candidate timings are printed during official inference, and
 `progress_manifest.json` is atomically updated after every completed batch.
 Dry-run the exact bounded contract before starting CUDA inference:

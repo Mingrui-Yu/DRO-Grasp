@@ -16,7 +16,10 @@ from .contracts import (
     DRO_BENCH_LINK_PAIRS,
     DRO_SHADOW_Q_NAMES,
     FILTERED_RAW_SCHEMA_VERSION,
+    FILTERED_RUN_SCHEMA_VERSIONS,
     FILTERED_RUN_SCHEMA_VERSION,
+    LEGACY_FILTERED_RAW_SCHEMA_VERSION,
+    LEGACY_FILTERED_RUN_SCHEMA_VERSION,
     LEGACY_RAW_SCHEMA_VERSION,
     LEGACY_RUN_SCHEMA_VERSION,
     RAW_SCHEMA_VERSION,
@@ -58,6 +61,8 @@ class OutputScene:
     scale: float
     manifest: dict
     failure: Optional[dict]
+    returned_candidate_count: int
+    result_kind: Optional[str]
 
 
 @dataclass(frozen=True)
@@ -739,13 +744,16 @@ class ViewerRun:
             raise ValueError("failure manifest schema does not match run manifest")
         if self.manifest.get("status") not in {
             "completed",
+            "completed_with_shortfalls",
             "completed_with_failures",
             "failed",
         }:
             raise ValueError("run manifest is not in a terminal state")
         if self.manifest.get("resolved_config") != self.resolved_config:
             raise ValueError("run_manifest resolved_config does not match resolved_config.json")
-        if self.run_schema_version in (RUN_SCHEMA_VERSION, FILTERED_RUN_SCHEMA_VERSION):
+        filtered_run = self.run_schema_version in FILTERED_RUN_SCHEMA_VERSIONS
+        partial_filtered_run = self.run_schema_version == FILTERED_RUN_SCHEMA_VERSION
+        if self.run_schema_version == RUN_SCHEMA_VERSION or filtered_run:
             initialization = self.resolved_config.get("initialization")
             if (
                 not isinstance(initialization, dict)
@@ -839,6 +847,29 @@ class ViewerRun:
                 _resolve_inside(
                     self.output_root, value.get("grasp_artifact"), "grasp artifact"
                 )
+                returned_candidate_count = (
+                    value.get("returned_candidate_count")
+                    if partial_filtered_run
+                    else self.candidate_count
+                )
+                if (
+                    not isinstance(returned_candidate_count, int)
+                    or isinstance(returned_candidate_count, bool)
+                    or not 0 <= returned_candidate_count <= self.candidate_count
+                ):
+                    raise ValueError(
+                        f"invalid returned candidate count for {scene_id}"
+                    )
+                result_kind = value.get("result_kind") if partial_filtered_run else "full"
+                expected_kind = (
+                    "full"
+                    if returned_candidate_count == self.candidate_count
+                    else "partial"
+                    if returned_candidate_count
+                    else "empty"
+                )
+                if result_kind != expected_kind:
+                    raise ValueError(f"invalid result kind for {scene_id}")
             else:
                 if failure is None:
                     raise ValueError(f"failed scene has no failure reason: {scene_id}")
@@ -847,12 +878,16 @@ class ViewerRun:
                     value.get("failed_raw_artifact"),
                     "failed raw artifact",
                 )
+                returned_candidate_count = 0
+                result_kind = None
             scenes[scene_id] = OutputScene(
                 scene_id=scene_id,
                 status=status,
                 scale=scale,
                 manifest=value,
                 failure=failure,
+                returned_candidate_count=returned_candidate_count,
+                result_kind=result_kind,
             )
         if set(failure_by_scene) != {
             scene.scene_id for scene in scenes.values() if scene.status == "failed"
@@ -865,7 +900,24 @@ class ViewerRun:
         expected_candidate_count = len(scenes) * self.candidate_count
         if self.manifest.get("candidate_count") != expected_candidate_count:
             raise ValueError("run manifest candidate_count accounting mismatch")
-        if self.manifest.get("completed_candidate_count") != (
+        if partial_filtered_run:
+            returned_count = sum(
+                scene.returned_candidate_count
+                for scene in scenes.values()
+                if scene.status == "completed"
+            )
+            shortfall_count = sum(
+                self.candidate_count - scene.returned_candidate_count
+                for scene in scenes.values()
+                if scene.status == "completed"
+            )
+            if self.manifest.get("returned_candidate_count") != returned_count or self.manifest.get(
+                "completed_candidate_count"
+            ) != returned_count:
+                raise ValueError("run manifest returned candidate accounting mismatch")
+            if self.manifest.get("shortfall_candidate_count") != shortfall_count:
+                raise ValueError("run manifest shortfall candidate accounting mismatch")
+        elif self.manifest.get("completed_candidate_count") != (
             completed_count * self.candidate_count
         ):
             raise ValueError("run manifest completed candidate accounting mismatch")
@@ -887,7 +939,15 @@ class ViewerRun:
         return tuple(
             scene_id
             for scene_id, scene in self.scenes.items()
-            if scene.status == "completed"
+            if scene.status == "completed" and scene.returned_candidate_count > 0
+        )
+
+    @property
+    def empty_scenes(self) -> tuple:
+        return tuple(
+            scene
+            for scene in self.scenes.values()
+            if scene.status == "completed" and scene.returned_candidate_count == 0
         )
 
     @property
@@ -909,6 +969,12 @@ class ViewerRun:
                 self.scenes[scene_id].scale, requested, rel_tol=0.0, abs_tol=1e-12
             )
         )
+
+    def candidate_count_for_scene(self, scene_id: str) -> int:
+        entry = self.scenes.get(scene_id)
+        if entry is None:
+            raise ValueError(f"unknown scene_id: {scene_id}")
+        return entry.returned_candidate_count
 
     def _palm_object_transforms(self, stage_q: np.ndarray) -> np.ndarray:
         if self.palm_fk_chain is None:
@@ -957,7 +1023,10 @@ class ViewerRun:
                 raise ValueError(
                     f"{source_name} object_pose_wxyz mismatch for {entry.scene_id}"
                 )
-        if self.run_schema_version in (RUN_SCHEMA_VERSION, FILTERED_RUN_SCHEMA_VERSION):
+        if (
+            self.run_schema_version == RUN_SCHEMA_VERSION
+            or self.run_schema_version in FILTERED_RUN_SCHEMA_VERSIONS
+        ):
             for source_name, source in (
                 ("run manifest", manifest_scene),
                 ("raw scene", raw_scene),
@@ -1003,6 +1072,8 @@ class ViewerRun:
         expected_raw_schema = (
             LEGACY_RAW_SCHEMA_VERSION
             if self.run_schema_version == LEGACY_RUN_SCHEMA_VERSION
+            else LEGACY_FILTERED_RAW_SCHEMA_VERSION
+            if self.run_schema_version == LEGACY_FILTERED_RUN_SCHEMA_VERSION
             else FILTERED_RAW_SCHEMA_VERSION
             if self.run_schema_version == FILTERED_RUN_SCHEMA_VERSION
             else RAW_SCHEMA_VERSION
@@ -1016,18 +1087,22 @@ class ViewerRun:
         if raw.get("palm_fk") != self.palm_fk_metadata:
             raise ValueError(f"palm FK provenance mismatch for {scene_id}")
         self._validate_scene_provenance(entry, record, raw)
-        if self.run_schema_version in (RUN_SCHEMA_VERSION, FILTERED_RUN_SCHEMA_VERSION):
+        selected_count = entry.returned_candidate_count
+        if (
+            self.run_schema_version == RUN_SCHEMA_VERSION
+            or self.run_schema_version in FILTERED_RUN_SCHEMA_VERSIONS
+        ):
             from .runner import _validate_v2_initialization_raw
 
             _validate_v2_initialization_raw(
                 raw,
                 record,
                 self.resolved_config,
-                self.candidate_count,
+                selected_count,
                 require_all=True,
                 proposal_indices=(
                     raw.get("selected_proposal_indices")
-                    if self.run_schema_version == FILTERED_RUN_SCHEMA_VERSION
+                    if self.run_schema_version in FILTERED_RUN_SCHEMA_VERSIONS
                     else None
                 ),
             )
@@ -1044,7 +1119,7 @@ class ViewerRun:
             raise ValueError(f"object point-cloud hash mismatch for {scene_id}")
 
         expected_stage_shape = (
-            self.candidate_count,
+            selected_count,
             len(STAGE_NAMES),
             len(DRO_SHADOW_Q_NAMES),
         )
@@ -1085,12 +1160,12 @@ class ViewerRun:
         robot_pose = np.asarray(artifact.get("robot_pose"))
         if robot_pose.shape != (
             1,
-            self.candidate_count,
+            selected_count,
             len(STAGE_NAMES),
             7 + len(BENCH_SHADOW_JOINT_NAMES),
         ) or robot_pose.dtype != np.float32:
             raise ValueError(
-                f"robot_pose must be float32 [1,{self.candidate_count},3,29] "
+                f"robot_pose must be float32 [1,{selected_count},3,29] "
                 f"for {scene_id}, got {robot_pose.shape} {robot_pose.dtype}"
             )
         if not np.isfinite(robot_pose).all():
@@ -1138,13 +1213,19 @@ class ViewerRun:
     ) -> PreparedSelection:
         """Prepare one selection for Viser without mutating any input file."""
 
+        loaded = self.load_scene(scene_id)
+        candidate_count = loaded.entry.returned_candidate_count
+        if candidate_count == 0:
+            raise ValueError(
+                f"scene {scene_id} completed with zero tabletop-valid grasps"
+            )
         if (
             not isinstance(candidate_index, int)
             or isinstance(candidate_index, bool)
-            or not 0 <= candidate_index < self.candidate_count
+            or not 0 <= candidate_index < candidate_count
         ):
             raise ValueError(
-                f"candidate index must be in [0,{self.candidate_count - 1}], "
+                f"candidate index must be in [0,{candidate_count - 1}], "
                 f"got {candidate_index}"
             )
         if stage not in STAGE_NAMES:
@@ -1157,7 +1238,6 @@ class ViewerRun:
             raise ValueError("dro_bench_overlay mode requires --bench-mjcf")
         if pose_source not in {"exported", "raw"}:
             raise ValueError("pose_source must be exported or raw")
-        loaded = self.load_scene(scene_id)
         record = loaded.record
         object_world = pose_wxyz_to_matrix(record.object_pose_wxyz)
 
@@ -1376,6 +1456,10 @@ def diagnostics_markdown(prepared: PreparedSelection, run: ViewerRun) -> str:
             f"{_failure_message(failure) or 'no message'}"
         )
     failed_text = "\n".join(failed_lines) if failed_lines else "- none"
+    empty_lines = [
+        f"- `{scene.scene_id}`: 0 returned grasps" for scene in run.empty_scenes[:5]
+    ]
+    empty_text = "\n".join(empty_lines) if empty_lines else "- none"
     if value["max_link_position_error_m"] is None:
         alignment_text = "- DRO/Bench overlay: not selected\n"
     else:
@@ -1401,5 +1485,7 @@ def diagnostics_markdown(prepared: PreparedSelection, run: ViewerRun) -> str:
         f"- Frame: `{value['frame_contract']}`\n"
         f"{alignment_text}"
         "\n### Failed scenes (not renderable)\n"
-        f"{failed_text}"
+        f"{failed_text}\n"
+        "\n### Empty completed scenes (not renderable)\n"
+        f"{empty_text}"
     )
