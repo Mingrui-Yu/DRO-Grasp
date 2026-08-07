@@ -59,11 +59,11 @@ collision loss or execution-path check.
   root translation and `q[6:]` match for each paired candidate. The CPU and
   applicable CUDA Torch RNG-state digests are captured immediately before
   network forward to verify identical validation latent state.
-- Filtered production budget: `tabletop_filtered` generates complete batches of
-  100 candidates. Each batch is five unchanged 20-slot initialization groups,
-  so the existing initialization proposal contract is reused rather than
-  redefined. Valid candidates accumulate across batches until at least 20 are
-  available or the explicit positive `max_batches` limit is reached.
+- Filtered production budget: `tabletop_filtered` generates complete batches
+  whose size is a positive multiple of the unchanged 20-slot initialization
+  group. Valid candidates accumulate across batches until at least 20 are
+  available or the explicit positive `max_batches` limit is reached. Therefore
+  `batch_size * max_batches` is the hard generated-candidate cap per scene.
 - Final-pose table filter: only the export-clamped `grasp_qpos` corresponding to
   `predict_q` is checked. The model parses the released URDF `collision`
   geometry and selects `palm` plus all kinematic descendants; `forearm`,
@@ -342,8 +342,12 @@ The Issue #47 config resolves exactly three bottle-like DGN2k tabletop scenes:
 - `scale030`, persisted actual scale `0.30`.
 
 It intentionally clears `reference_grasp_roots`, uses the checked-in scene list,
-and pins the three-scene manifest hash. Dry-run the exact bounded contract before
-starting CUDA inference:
+and pins the three-scene manifest hash. Its filtered budget is one 20-candidate
+initialization group per batch and at most five batches, so each scene stops as
+soon as 20 valid grasps exist and can never generate more than 100 candidates.
+Per-candidate timings are printed during official inference, and
+`progress_manifest.json` is atomically updated after every completed batch.
+Dry-run the exact bounded contract before starting CUDA inference:
 
 ```bash
 DRO_PYTHON="${DRO_PYTHON:-../.conda-envs/dro/bin/python}"
