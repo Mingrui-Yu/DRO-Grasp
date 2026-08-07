@@ -59,11 +59,10 @@ collision loss or execution-path check.
   root translation and `q[6:]` match for each paired candidate. The CPU and
   applicable CUDA Torch RNG-state digests are captured immediately before
   network forward to verify identical validation latent state.
-- Filtered production budget: `tabletop_filtered` generates complete batches of
-  100 candidates, implemented as five unchanged 20-slot initialization groups.
-  Valid candidates accumulate across batches until at least 20 are available or
-  five batches are complete. The hard generated-candidate cap is therefore 500
-  per scene.
+- Filtered production budget: `tabletop_filtered` generates exactly one complete
+  20-candidate initialization group per scene. The hard generated-candidate cap
+  is therefore 20 per scene. Every candidate that passes the final-pose table
+  filter is returned, so completed artifacts contain between zero and 20 grasps.
 - Final-pose table filter: only the export-clamped `grasp_qpos` corresponding to
   `predict_q` is checked. The model parses the released URDF `collision`
   geometry and selects `palm` plus all kinematic descendants; `forearm`,
@@ -71,18 +70,16 @@ collision loss or execution-path check.
   against the explicit scene table plane with `margin = 0`, and every included
   geometry must satisfy strict `min_z > 0`. `pregrasp`, `squeeze`, interpolation,
   approach, arm paths, object collision, and self-collision are not checked.
-- Filtered selection: after reaching the target, a persisted scene-specific Seed
-  drives uniform random sampling without replacement from all accumulated valid
-  candidates. No score, top-k, quality weighting, diversity ranking, deduplication,
-  or manual choice is used. Source batch/candidate/proposal indices and generation
-  and selection Seeds are persisted for every selected grasp. If the 500-candidate
-  budget ends below the target, all valid candidates are retained in stable
-  generation order.
+- Filtered selection: because the generation cap equals the 20-candidate target,
+  no valid candidate is downsampled. All passing candidates are retained in stable
+  generation order. No score, top-k, quality weighting, diversity ranking,
+  deduplication, padding, or manual choice is used. Source batch/candidate/proposal
+  indices and generation and selection Seeds remain persisted for provenance.
 - Partial-success policy: baseline outputs remain scene-atomic under their
   original 20-candidate policy. Filtered production records individual inference
   failures and continues accumulating other candidates. Structural scene,
   inference, filter, FK, or export failures still fail the scene. Reaching the
-  500-candidate budget below 20 valid grasps is instead a normal `partial` or
+  20-candidate budget below 20 valid grasps is instead a normal `partial` or
   `empty` result: every valid grasp is returned without relaxing the filter,
   duplicating grasps, or padding the artifact.
 
@@ -189,7 +186,7 @@ python grasp_generation/scripts/generate_bimanbodex_dro.py \
   --config grasp_generation/experiments/bimanbodex_dro/config.json \
   --initialization-mode tabletop_stratified \
   --production-mode tabletop_filtered \
-  --max-batches 5 \
+  --max-batches 1 \
   --selection-seed 240826 \
   --dry-run
 ```
@@ -217,7 +214,7 @@ DRO_PYTHON="${DRO_PYTHON:-../.conda-envs/dro/bin/python}"
   --config grasp_generation/experiments/bimanbodex_dro/config.json \
   --initialization-mode tabletop_stratified \
   --production-mode tabletop_filtered \
-  --max-batches 5 \
+  --max-batches 1 \
   --selection-seed 240826 \
   --max-scenes 1 \
   --output-root /path/to/new/issue42-tabletop-filtered-seed240826
@@ -348,10 +345,9 @@ The Issue #47 config resolves exactly three bottle-like DGN2k tabletop scenes:
 - `scale030`, persisted actual scale `0.30`.
 
 It intentionally clears `reference_grasp_roots`, uses the checked-in scene list,
-and pins the three-scene manifest hash. Its filtered budget is 100 candidates
-per batch and at most five batches, so each scene stops after the first complete
-batch that reaches 20 valid grasps and can never generate more than 500
-candidates. A scene that remains below 20 returns all valid grasps, including an
+and pins the three-scene manifest hash. Its filtered budget is one complete
+20-candidate batch, so each scene can never generate more than 20 candidates.
+A scene that remains below 20 returns all valid grasps, including an
 explicit zero-length artifact when no candidate passes.
 Per-candidate timings are printed during official inference, and
 `progress_manifest.json` is atomically updated after every completed batch.

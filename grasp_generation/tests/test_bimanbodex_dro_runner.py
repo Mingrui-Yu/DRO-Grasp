@@ -298,8 +298,7 @@ class RunnerTests(unittest.TestCase):
                     result["initialization_metadata"][proposal_index] = item
                 call_index = self.call_count
                 self.call_count += 1
-                batch_index = call_index // 5
-                group_index = call_index % 5
+                batch_index = call_index
                 root_z = DRO_SHADOW_Q_NAMES.index("virtual_joint_z")
                 ffj4 = DRO_SHADOW_Q_NAMES.index("FFJ4")
                 result["stage_q"][:, :, root_z] = -1.0
@@ -307,7 +306,7 @@ class RunnerTests(unittest.TestCase):
                 result["stage_q"][:, 1, ffj4] = 0.0
                 result["stage_q"][:, 2, ffj4] = -0.3
                 for proposal_index in range(len(candidate_seeds)):
-                    batch_candidate_index = group_index * 20 + proposal_index
+                    batch_candidate_index = proposal_index
                     if pass_predicate(batch_index, batch_candidate_index):
                         result["stage_q"][proposal_index, :, root_z] = 0.0
                     if failure_predicate is not None and failure_predicate(
@@ -327,12 +326,12 @@ class RunnerTests(unittest.TestCase):
 
         return FilteredInference()
 
-    def filtered_config(self, output_root, *, max_batches=5, selection_seed=91):
+    def filtered_config(self, output_root, *, max_batches=1, selection_seed=91):
         config = copy.deepcopy(self.config)
         config["output_root"] = str(output_root)
         config["production"] = {
             "mode": "tabletop_filtered",
-            "batch_size": 100,
+            "batch_size": 20,
             "target_count": 20,
             "max_batches": max_batches,
             "selection_seed": selection_seed,
@@ -362,14 +361,14 @@ class RunnerTests(unittest.TestCase):
     def test_filtered_production_requires_fixed_contract_controls(self):
         base = self.filtered_config(self.root / "unused-output")
         resolved = resolve_config(self.repo_root, base)
-        self.assertEqual(resolved["production"]["groups_per_batch"], 5)
+        self.assertEqual(resolved["production"]["groups_per_batch"], 1)
 
         invalid_values = (
             ("max_batches", None, "explicit max_batches"),
-            ("max_batches", 4, "exactly 5"),
+            ("max_batches", 2, "exactly 1"),
             ("selection_seed", None, "explicit selection_seed"),
-            ("batch_size", 99, "divisible by candidate_count"),
-            ("batch_size", 20, "exactly 100"),
+            ("batch_size", 19, "divisible by candidate_count"),
+            ("batch_size", 100, "match candidate_count=20"),
             ("target_count", 19, "match candidate_count"),
             ("filter_stage", "pregrasp", "final grasp_qpos"),
             ("filter_root_link", "wrist", "remain palm"),
@@ -415,25 +414,23 @@ class RunnerTests(unittest.TestCase):
         with self.assertRaises(FileExistsError):
             run(self.repo_root, self.config, self.successful_inference)
 
-    def test_filtered_production_randomly_selects_twenty_from_first_batch(self):
+    def test_filtered_production_returns_all_twenty_from_its_only_batch(self):
         output_root = self.root / "filtered-random-output"
         config = self.filtered_config(output_root, selection_seed=101)
         inference = self.filtered_inference(lambda _batch, _candidate: True)
         manifest = run(self.repo_root, config, inference)
-        self.assertEqual(inference.call_count, 5)
+        self.assertEqual(inference.call_count, 1)
         self.assertEqual(manifest["schema_version"], FILTERED_RUN_SCHEMA_VERSION)
         self.assertEqual(manifest["candidate_count"], 20)
         self.assertEqual(manifest["completed_candidate_count"], 20)
-        self.assertEqual(manifest["generated_candidate_count"], 100)
-        self.assertEqual(manifest["table_collision_free_candidate_count"], 100)
+        self.assertEqual(manifest["generated_candidate_count"], 20)
+        self.assertEqual(manifest["table_collision_free_candidate_count"], 20)
         self.assertEqual(manifest["table_rejected_candidate_count"], 0)
 
         raw_path = output_root / "raw" / "object_a" / "floating" / "scale013.npy"
         raw = np.load(raw_path, allow_pickle=True).item()
         self.assertEqual(raw["schema_version"], FILTERED_RAW_SCHEMA_VERSION)
-        expected_selection = np.random.default_rng(raw["selection_seed"]).choice(
-            np.arange(100, dtype=np.int64), size=20, replace=False
-        ).tolist()
+        expected_selection = list(range(20))
         self.assertEqual(raw["selected_source_indices"], expected_selection)
         self.assertEqual(len(set(expected_selection)), 20)
         root_z = DRO_SHADOW_Q_NAMES.index("virtual_joint_z")
@@ -472,7 +469,7 @@ class RunnerTests(unittest.TestCase):
         )
         np.save(artifact_path, artifact, allow_pickle=True)
         validation = validate_run_outputs(output_root)
-        self.assertEqual(validation["generated_candidate_count"], 100)
+        self.assertEqual(validation["generated_candidate_count"], 20)
         loaded = ViewerRun(output_root).load_scene("object_a/floating/scale013")
         self.assertEqual(loaded.raw["schema_version"], FILTERED_RAW_SCHEMA_VERSION)
 
@@ -484,34 +481,83 @@ class RunnerTests(unittest.TestCase):
         manifest_path = output_root / "run_manifest.json"
         failure_path = output_root / "failure_manifest.json"
         raw_path = output_root / "raw" / "object_a" / "floating" / "scale013.npy"
+        artifact_path = (
+            output_root
+            / "graspdata"
+            / "object_a"
+            / "floating"
+            / "scale013_grasp.npy"
+        )
         manifest = json.loads(manifest_path.read_text())
         failure_manifest = json.loads(failure_path.read_text())
         raw = np.load(raw_path, allow_pickle=True).item()
+        artifact = np.load(artifact_path, allow_pickle=True).item()
+        legacy_selection = np.random.default_rng(raw["selection_seed"]).choice(
+            np.arange(20, dtype=np.int64), size=20, replace=False
+        ).tolist()
+        raw["selected_source_indices"] = legacy_selection
+        raw["selected_candidate_sources"] = [
+            raw["generation_candidate_sources"][index]
+            for index in legacy_selection
+        ]
+        raw["selected_proposal_indices"] = [
+            item["proposal_index"] for item in raw["selected_candidate_sources"]
+        ]
+        for field in (
+            "candidate_seeds",
+            "initialization_metadata",
+            "pre_network_rng_state_sha256",
+        ):
+            generated_field = {
+                "candidate_seeds": "generation_candidate_seeds",
+                "initialization_metadata": "generation_initialization_metadata",
+                "pre_network_rng_state_sha256": (
+                    "generation_pre_network_rng_state_sha256"
+                ),
+            }[field]
+            raw[field] = [raw[generated_field][index] for index in legacy_selection]
+        for field in (
+            "released_initial_q",
+            "initial_q",
+            "stage_q",
+            "export_stage_q",
+            "timing_seconds",
+        ):
+            generated_field = {
+                "released_initial_q": "generation_released_initial_q",
+                "initial_q": "generation_initial_q",
+                "stage_q": "generation_stage_q",
+                "export_stage_q": "generation_export_stage_q",
+                "timing_seconds": "generation_timing_seconds",
+            }[field]
+            raw[field] = raw[generated_field][legacy_selection]
+        artifact["robot_pose"] = artifact["robot_pose"][:, legacy_selection]
         manifest["schema_version"] = LEGACY_FILTERED_RUN_SCHEMA_VERSION
         failure_manifest["schema_version"] = LEGACY_FILTERED_RUN_SCHEMA_VERSION
         raw["schema_version"] = LEGACY_FILTERED_RAW_SCHEMA_VERSION
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
         failure_path.write_text(json.dumps(failure_manifest), encoding="utf-8")
         np.save(raw_path, raw, allow_pickle=True)
+        np.save(artifact_path, artifact, allow_pickle=True)
 
         self.assertEqual(validate_run_outputs(output_root)["status"], "valid")
         loaded = ViewerRun(output_root).load_scene("object_a/floating/scale013")
         self.assertEqual(loaded.artifact["robot_pose"].shape, (1, 20, 3, 29))
 
-    def test_filtered_production_continues_by_full_batches_until_twenty(self):
-        output_root = self.root / "filtered-repeat-output"
+    def test_filtered_production_returns_nineteen_without_regeneration(self):
+        output_root = self.root / "filtered-nineteen-output"
         config = self.filtered_config(output_root, selection_seed=102)
         inference = self.filtered_inference(
-            lambda batch, candidate: (
-                (batch == 0 and candidate < 19)
-                or (batch == 1 and candidate == 0)
-            )
+            lambda batch, candidate: batch == 0 and candidate < 19
         )
         manifest = run(self.repo_root, config, inference)
-        self.assertEqual(inference.call_count, 10)
-        self.assertEqual(manifest["generated_candidate_count"], 200)
-        self.assertEqual(manifest["table_collision_free_candidate_count"], 20)
-        self.assertEqual(manifest["table_rejected_candidate_count"], 180)
+        self.assertEqual(inference.call_count, 1)
+        self.assertEqual(manifest["status"], "completed_with_shortfalls")
+        self.assertEqual(manifest["generated_candidate_count"], 20)
+        self.assertEqual(manifest["returned_candidate_count"], 19)
+        self.assertEqual(manifest["shortfall_candidate_count"], 1)
+        self.assertEqual(manifest["table_collision_free_candidate_count"], 19)
+        self.assertEqual(manifest["table_rejected_candidate_count"], 1)
         raw_path = output_root / "raw" / "object_a" / "floating" / "scale013.npy"
         raw = np.load(raw_path, allow_pickle=True).item()
         self.assertEqual(
@@ -519,31 +565,23 @@ class RunnerTests(unittest.TestCase):
             [
                 {
                     "batch_index": 0,
-                    "generated_count": 100,
+                    "generated_count": 20,
                     "table_collision_free_count": 19,
-                    "table_rejected_count": 81,
+                    "table_rejected_count": 1,
                     "inference_failed_count": 0,
                     "cumulative_valid_count": 19,
-                },
-                {
-                    "batch_index": 1,
-                    "generated_count": 100,
-                    "table_collision_free_count": 1,
-                    "table_rejected_count": 99,
-                    "inference_failed_count": 0,
-                    "cumulative_valid_count": 20,
-                },
+                }
             ],
         )
-        self.assertEqual(set(raw["selected_source_indices"]), {*range(19), 100})
+        self.assertEqual(raw["selected_source_indices"], list(range(19)))
         self.assertEqual(validate_run_outputs(output_root)["status"], "valid")
 
-    def test_filtered_production_returns_empty_artifact_after_five_batches(self):
+    def test_filtered_production_returns_empty_artifact_after_only_batch(self):
         output_root = self.root / "filtered-empty-output"
         config = self.filtered_config(output_root, selection_seed=103)
         inference = self.filtered_inference(lambda _batch, _candidate: False)
         manifest = run(self.repo_root, config, inference)
-        self.assertEqual(inference.call_count, 25)
+        self.assertEqual(inference.call_count, 1)
         self.assertEqual(manifest["status"], "completed_with_shortfalls")
         self.assertEqual(manifest["candidate_count"], 20)
         self.assertEqual(manifest["completed_candidate_count"], 0)
@@ -551,7 +589,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(manifest["shortfall_candidate_count"], 20)
         self.assertEqual(manifest["failed_candidate_count"], 0)
         self.assertEqual(manifest["empty_scene_count"], 1)
-        self.assertEqual(manifest["generated_candidate_count"], 500)
+        self.assertEqual(manifest["generated_candidate_count"], 20)
         self.assertEqual(manifest["table_collision_free_candidate_count"], 0)
         artifact_path = (
             output_root
@@ -565,7 +603,7 @@ class RunnerTests(unittest.TestCase):
         raw_path = output_root / "raw" / "object_a" / "floating" / "scale013.npy"
         raw = np.load(raw_path, allow_pickle=True).item()
         self.assertEqual(raw["result_kind"], "empty")
-        self.assertEqual(raw["generated_candidate_count"], 500)
+        self.assertEqual(raw["generated_candidate_count"], 20)
         self.assertEqual(raw["valid_candidate_count"], 0)
         self.assertEqual(raw["returned_candidate_count"], 0)
         self.assertEqual(raw["shortfall_candidate_count"], 20)
@@ -583,17 +621,17 @@ class RunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "zero tabletop-valid grasps"):
             viewer.prepare_selection(None, "object_a/floating/scale013")
 
-    def test_filtered_production_returns_all_seven_after_five_batches(self):
+    def test_filtered_production_returns_all_seven_after_only_batch(self):
         output_root = self.root / "filtered-partial-output"
         config = self.filtered_config(output_root, selection_seed=107)
-        expected_indices = {0, 101, 202, 303, 404, 405, 406}
+        expected_indices = {0, 2, 4, 6, 8, 10, 12}
         inference = self.filtered_inference(
-            lambda batch, candidate: batch * 100 + candidate in expected_indices
+            lambda batch, candidate: batch == 0 and candidate in expected_indices
         )
 
         manifest = run(self.repo_root, config, inference)
 
-        self.assertEqual(inference.call_count, 25)
+        self.assertEqual(inference.call_count, 1)
         self.assertEqual(manifest["status"], "completed_with_shortfalls")
         self.assertEqual(manifest["returned_candidate_count"], 7)
         self.assertEqual(manifest["shortfall_candidate_count"], 13)
@@ -629,29 +667,30 @@ class RunnerTests(unittest.TestCase):
             failure_predicate=lambda _batch, candidate: candidate % 20 == 19,
         )
         manifest = run(self.repo_root, config, inference)
-        self.assertEqual(manifest["status"], "completed")
-        self.assertEqual(manifest["generated_candidate_count"], 100)
-        self.assertEqual(manifest["table_collision_free_candidate_count"], 95)
-        self.assertEqual(manifest["inference_failed_generation_candidate_count"], 5)
+        self.assertEqual(manifest["status"], "completed_with_shortfalls")
+        self.assertEqual(manifest["generated_candidate_count"], 20)
+        self.assertEqual(manifest["table_collision_free_candidate_count"], 19)
+        self.assertEqual(manifest["returned_candidate_count"], 19)
+        self.assertEqual(manifest["inference_failed_generation_candidate_count"], 1)
         raw_path = output_root / "raw" / "object_a" / "floating" / "scale013.npy"
         raw = np.load(raw_path, allow_pickle=True).item()
-        self.assertEqual(len(raw["generation_candidate_failures"]), 5)
+        self.assertEqual(len(raw["generation_candidate_failures"]), 1)
         self.assertEqual(
             {
                 item["generation_index"]
                 for item in raw["generation_candidate_failures"]
             },
-            {19, 39, 59, 79, 99},
+            {19},
         )
         self.assertTrue(
             all(
-                index not in {19, 39, 59, 79, 99}
+                index != 19
                 for index in raw["selected_source_indices"]
             )
         )
         validation = validate_run_outputs(output_root)
         self.assertEqual(
-            validation["inference_failed_generation_candidate_count"], 5
+            validation["inference_failed_generation_candidate_count"], 1
         )
 
     def test_filtered_structural_inference_error_remains_scene_failure(self):
@@ -675,7 +714,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(validation["status"], "valid")
         self.assertEqual(validation["failed_candidate_count"], 20)
 
-    def test_filtered_production_reuses_each_twenty_slot_initialization_group(self):
+    def test_filtered_production_uses_each_twenty_slot_initialization_once(self):
         output_root = self.root / "filtered-tabletop-initialization-output"
         config = self.filtered_config(output_root, selection_seed=105)
         config["initialization"] = default_initialization_config()
@@ -690,15 +729,15 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(
             [
                 raw["generation_candidate_sources"][index]["proposal_index"]
-                for index in (0, 20, 40, 60, 80)
+                for index in range(20)
             ],
-            [0, 0, 0, 0, 0],
+            list(range(20)),
         )
         self.assertTrue(
             all(
                 raw["generation_initialization_metadata"][index]["candidate_index"]
                 == index % 20
-                for index in range(100)
+                for index in range(20)
             )
         )
         np.testing.assert_array_equal(
