@@ -17,6 +17,8 @@ import numpy as np
 
 from .contracts import (
     DRO_SHADOW_Q_NAMES,
+    FILTERED_RAW_SCHEMA_VERSION,
+    FILTERED_RUN_SCHEMA_VERSION,
     LEGACY_RAW_SCHEMA_VERSION,
     LEGACY_RUN_SCHEMA_VERSION,
     RAW_SCHEMA_VERSION,
@@ -44,6 +46,10 @@ from .initialization import (
     resolve_initialization_config,
     torch_rng_state_digests,
 )
+from .tabletop_filter import TabletopCollisionModel
+
+
+PRODUCTION_MODES = ("unfiltered_baseline", "tabletop_filtered")
 
 
 def utc_now() -> str:
@@ -180,6 +186,76 @@ def _resolve_path(repo_root: Path, value, *, required: bool = True):
     return path.resolve(strict=required)
 
 
+def _resolve_production_config(value, candidate_count: int) -> dict:
+    """Resolve the isolated baseline or tabletop-filtered production semantics."""
+
+    defaults = {
+        "mode": "unfiltered_baseline",
+        "batch_size": 100,
+        "target_count": candidate_count,
+        "max_batches": None,
+        "selection_seed": None,
+        "filter_stage": "grasp",
+        "filter_root_link": "palm",
+        "table_margin": 0.0,
+    }
+    if value is None:
+        provided = {}
+    elif isinstance(value, dict):
+        provided = dict(value)
+    else:
+        raise ValueError("production must be an object")
+    unknown = sorted(set(provided) - set(defaults))
+    if unknown:
+        raise ValueError(f"unknown production controls: {unknown}")
+    resolved = {**defaults, **provided}
+    if resolved["mode"] not in PRODUCTION_MODES:
+        raise ValueError(f"production mode must be one of {PRODUCTION_MODES}")
+
+    for name in ("batch_size", "target_count"):
+        control = resolved[name]
+        if not isinstance(control, int) or isinstance(control, bool) or control <= 0:
+            raise ValueError(f"production {name} must be a positive integer")
+    if resolved["target_count"] != candidate_count:
+        raise ValueError("production target_count must match candidate_count=20")
+    if resolved["batch_size"] != 100:
+        raise ValueError("production batch_size must remain the approved 100 candidates")
+    if resolved["batch_size"] % candidate_count != 0:
+        raise ValueError("production batch_size must be divisible by candidate_count")
+
+    max_batches = resolved["max_batches"]
+    if max_batches is not None and (
+        not isinstance(max_batches, int)
+        or isinstance(max_batches, bool)
+        or max_batches <= 0
+    ):
+        raise ValueError("production max_batches must be null or a positive integer")
+    selection_seed = resolved["selection_seed"]
+    if selection_seed is not None and (
+        not isinstance(selection_seed, int) or isinstance(selection_seed, bool)
+    ):
+        raise ValueError("production selection_seed must be null or an integer")
+    if resolved["filter_stage"] != "grasp":
+        raise ValueError("production filter_stage must remain final grasp_qpos")
+    if resolved["filter_root_link"] != "palm":
+        raise ValueError("production filter_root_link must remain palm")
+    margin = resolved["table_margin"]
+    if not isinstance(margin, (int, float)) or isinstance(margin, bool):
+        raise ValueError("production table_margin must be numeric")
+    resolved["table_margin"] = float(margin)
+    if not np.isfinite(resolved["table_margin"]) or resolved["table_margin"] != 0.0:
+        raise ValueError("production table_margin must remain exactly 0")
+
+    if resolved["mode"] == "tabletop_filtered":
+        if max_batches is None:
+            raise ValueError("tabletop_filtered production requires explicit max_batches")
+        if selection_seed is None:
+            raise ValueError("tabletop_filtered production requires explicit selection_seed")
+    resolved["generation_group_size"] = candidate_count
+    resolved["groups_per_batch"] = resolved["batch_size"] // candidate_count
+    return resolved
+
+
 def resolve_config(repo_root: Path, config: dict) -> dict:
     """Validate experiment controls without importing CUDA/network code."""
 
@@ -241,6 +317,9 @@ def resolve_config(repo_root: Path, config: dict) -> dict:
         raise ValueError("candidate_count must remain the approved 20 candidates per scene")
     resolved["initialization"] = resolve_initialization_config(
         config.get("initialization"), resolved["candidate_count"]
+    )
+    resolved["production"] = _resolve_production_config(
+        config.get("production"), resolved["candidate_count"]
     )
     if resolved["point_count"] != 512:
         raise ValueError("point_count must remain the official 512-point contract")
@@ -335,7 +414,7 @@ def dry_run(repo_root: Path, config: dict) -> dict:
     shadow_finger_joint_limits = load_dro_shadow_finger_joint_limits(
         Path(resolved["shadow_urdf"])
     )
-    return {
+    result = {
         "status": "dry_run",
         "scene_count": len(records),
         "source_scene_count": len(source_records),
@@ -353,7 +432,15 @@ def dry_run(repo_root: Path, config: dict) -> dict:
         "shadow_point_cloud_sha256": sha256_file(Path(resolved["shadow_point_cloud"])),
         "resolved_config": resolved,
         "initialization_mode": resolved["initialization"]["mode"],
+        "production_mode": resolved["production"]["mode"],
     }
+    if resolved["production"]["mode"] == "tabletop_filtered":
+        collision_model = TabletopCollisionModel.from_urdf(
+            Path(resolved["shadow_urdf"]),
+            root_link=resolved["production"]["filter_root_link"],
+        )
+        result["tabletop_collision_model"] = collision_model.to_manifest()
+    return result
 
 
 class OfficialDROInference:
@@ -618,6 +705,442 @@ def _validate_inference_result(result: dict, candidate_count: int):
     )
 
 
+def _empty_generation_arrays(candidate_count: int) -> dict:
+    """Return correctly shaped empty arrays for failed-before-generation scenes."""
+
+    q_count = len(DRO_SHADOW_Q_NAMES)
+    return {
+        "released_initial_q": np.empty((candidate_count, q_count), dtype=np.float32),
+        "initial_q": np.empty((candidate_count, q_count), dtype=np.float32),
+        "stage_q": np.empty(
+            (candidate_count, len(STAGE_NAMES), q_count), dtype=np.float32
+        ),
+        "export_stage_q": np.empty(
+            (candidate_count, len(STAGE_NAMES), q_count), dtype=np.float32
+        ),
+        "timing_seconds": np.empty((candidate_count,), dtype=np.float64),
+    }
+
+
+def _concatenate_generation_arrays(chunks: list[dict]) -> dict:
+    """Concatenate validated 20-candidate generation groups."""
+
+    if not chunks:
+        return _empty_generation_arrays(0)
+    return {
+        name: np.concatenate([chunk[name] for chunk in chunks], axis=0)
+        for name in (
+            "released_initial_q",
+            "initial_q",
+            "stage_q",
+            "export_stage_q",
+            "timing_seconds",
+        )
+    }
+
+
+def _source_record(
+    *,
+    generation_index: int,
+    batch_index: int,
+    batch_candidate_index: int,
+    group_index: int,
+    proposal_index: int,
+    generation_seed: int,
+) -> dict:
+    """Return stable source identity for one generated candidate."""
+
+    return {
+        "generation_index": generation_index,
+        "batch_index": batch_index,
+        "candidate_index": batch_candidate_index,
+        "generation_group_index": group_index,
+        "proposal_index": proposal_index,
+        "generation_seed": generation_seed,
+        "source_raw_candidate_id": (
+            f"batch{batch_index:03d}/candidate{batch_candidate_index:03d}"
+        ),
+    }
+
+
+def _generation_clamp_diagnostic_sort_key(value: dict) -> tuple:
+    """Return the canonical order for generated-candidate clamp evidence."""
+
+    return (
+        value["generation_index"],
+        value["stage_index"],
+        value["dro_joint_name"],
+        value["bench_joint_name"],
+    )
+
+
+def _run_tabletop_filtered_scene(
+    *,
+    record,
+    points: np.ndarray,
+    scene_point_seed: int,
+    resolved: dict,
+    inference,
+    palm_fk_chain,
+    collision_fk_chain,
+    palm_fk: dict,
+    shadow_finger_joint_limits: dict,
+    collision_model: TabletopCollisionModel,
+) -> tuple[dict | None, dict, dict | None, dict]:
+    """Generate/filter batches and return one selected 20-candidate scene."""
+
+    production = resolved["production"]
+    group_size = production["generation_group_size"]
+    groups_per_batch = production["groups_per_batch"]
+    target_count = production["target_count"]
+    grasp_stage_index = STAGE_NAMES.index(production["filter_stage"])
+
+    array_chunks = []
+    generation_sources = []
+    generation_candidate_seeds = []
+    generation_initialization_metadata = []
+    generation_rng_digests = []
+    generation_filter_diagnostics = []
+    generation_candidate_failures = []
+    generation_clamp_diagnostics = []
+    valid_generation_indices = []
+    batch_summaries = []
+    fatal_failure = None
+
+    for batch_index in range(production["max_batches"]):
+        batch_start = len(generation_sources)
+        for group_index in range(groups_per_batch):
+            batch_candidate_start = group_index * group_size
+            generation_start = len(generation_sources)
+            candidate_seeds = [
+                _stable_seed(
+                    resolved["inference_seed"],
+                    (
+                        f"{record.scene_id}:batch:{batch_index}:"
+                        f"candidate:{batch_candidate_start + proposal_index}"
+                    ),
+                )
+                for proposal_index in range(group_size)
+            ]
+            if len(set(candidate_seeds)) != len(candidate_seeds):
+                fatal_failure = {
+                    "scene_id": record.scene_id,
+                    "stage": "generation_seed_resolution",
+                    "error_type": "ValueError",
+                    "message": "generation seeds are not unique within one group",
+                    "policy": resolved["failure_policy"],
+                }
+                break
+            try:
+                result = inference(record, points, candidate_seeds)
+                (
+                    released_initial_q,
+                    initial_q,
+                    stage_q,
+                    timings,
+                    initialization_metadata,
+                    pre_network_rng_state_sha256,
+                    candidate_failures,
+                    failure_indices,
+                ) = _validate_inference_result(result, group_size)
+            except Exception as error:
+                fatal_failure = {
+                    "scene_id": record.scene_id,
+                    "stage": "inference_driver",
+                    "batch_index": batch_index,
+                    "generation_group_index": group_index,
+                    "error_type": type(error).__name__,
+                    "message": str(error),
+                    "policy": resolved["failure_policy"],
+                }
+                break
+
+            sources = [
+                _source_record(
+                    generation_index=generation_start + proposal_index,
+                    batch_index=batch_index,
+                    batch_candidate_index=batch_candidate_start + proposal_index,
+                    group_index=group_index,
+                    proposal_index=proposal_index,
+                    generation_seed=candidate_seeds[proposal_index],
+                )
+                for proposal_index in range(group_size)
+            ]
+            failure_list_start = len(generation_candidate_failures)
+            clamp_list_start = len(generation_clamp_diagnostics)
+            valid_list_start = len(valid_generation_indices)
+            generation_sources.extend(sources)
+            generation_candidate_seeds.extend(candidate_seeds)
+            generation_initialization_metadata.extend(initialization_metadata)
+            generation_rng_digests.extend(pre_network_rng_state_sha256)
+
+            export_stage_q = np.full_like(stage_q, np.nan)
+            filter_diagnostics = [None] * group_size
+            failure_index_set = set(failure_indices)
+            for failure in candidate_failures:
+                proposal_index = failure["candidate_index"]
+                source = sources[proposal_index]
+                remapped_failure = dict(failure)
+                remapped_failure.update(source)
+                generation_candidate_failures.append(remapped_failure)
+                filter_diagnostics[proposal_index] = {
+                    **source,
+                    "status": "inference_failed",
+                    "passed": False,
+                    "min_z": None,
+                    "margin": production["table_margin"],
+                    "worst_link": None,
+                    "worst_collision_index": None,
+                    "worst_geometry_type": None,
+                }
+
+            successful_indices = [
+                index for index in range(group_size) if index not in failure_index_set
+            ]
+            if successful_indices:
+                try:
+                    successful_export_q, clamp_diagnostics = (
+                        clamp_dro_shadow_export_stages(
+                            stage_q[successful_indices], shadow_finger_joint_limits
+                        )
+                    )
+                    export_stage_q[successful_indices] = successful_export_q
+                    passed, collision_diagnostics = collision_model.evaluate_final_grasps(
+                        collision_fk_chain,
+                        successful_export_q[:, grasp_stage_index, :],
+                        record,
+                        margin=production["table_margin"],
+                    )
+                except Exception as error:
+                    del generation_sources[generation_start:]
+                    del generation_candidate_seeds[generation_start:]
+                    del generation_initialization_metadata[generation_start:]
+                    del generation_rng_digests[generation_start:]
+                    del generation_candidate_failures[failure_list_start:]
+                    del generation_clamp_diagnostics[clamp_list_start:]
+                    del valid_generation_indices[valid_list_start:]
+                    fatal_failure = {
+                        "scene_id": record.scene_id,
+                        "stage": "tabletop_filter",
+                        "batch_index": batch_index,
+                        "generation_group_index": group_index,
+                        "error_type": type(error).__name__,
+                        "message": str(error),
+                        "policy": resolved["failure_policy"],
+                    }
+                    break
+
+                for diagnostic in clamp_diagnostics:
+                    subset_index = diagnostic["candidate_index"]
+                    proposal_index = successful_indices[subset_index]
+                    remapped = dict(diagnostic)
+                    remapped.update(sources[proposal_index])
+                    generation_clamp_diagnostics.append(remapped)
+                for subset_index, diagnostic in enumerate(collision_diagnostics):
+                    proposal_index = successful_indices[subset_index]
+                    source = sources[proposal_index]
+                    remapped = dict(diagnostic)
+                    remapped.update(source)
+                    filter_diagnostics[proposal_index] = remapped
+                    if passed[subset_index]:
+                        valid_generation_indices.append(source["generation_index"])
+
+            if fatal_failure is not None:
+                break
+            if any(item is None for item in filter_diagnostics):
+                raise RuntimeError("generation filter diagnostics are incomplete")
+            generation_filter_diagnostics.extend(filter_diagnostics)
+            array_chunks.append(
+                {
+                    "released_initial_q": released_initial_q,
+                    "initial_q": initial_q,
+                    "stage_q": stage_q,
+                    "export_stage_q": export_stage_q,
+                    "timing_seconds": timings,
+                }
+            )
+
+        batch_end = len(generation_sources)
+        batch_diagnostics = generation_filter_diagnostics[batch_start:batch_end]
+        if batch_end > batch_start or fatal_failure is None:
+            batch_summaries.append(
+                {
+                    "batch_index": batch_index,
+                    "generated_count": batch_end - batch_start,
+                    "table_collision_free_count": sum(
+                        item["status"] == "table_collision_free"
+                        for item in batch_diagnostics
+                    ),
+                    "table_rejected_count": sum(
+                        item["status"] == "table_rejected"
+                        for item in batch_diagnostics
+                    ),
+                    "inference_failed_count": sum(
+                        item["status"] == "inference_failed"
+                        for item in batch_diagnostics
+                    ),
+                    "cumulative_valid_count": len(valid_generation_indices),
+                }
+            )
+        if fatal_failure is not None or len(valid_generation_indices) >= target_count:
+            break
+
+    generated = _concatenate_generation_arrays(array_chunks)
+    generated_count = len(generation_sources)
+    if not all(
+        value.shape[0] == generated_count for value in generated.values()
+    ) or not all(
+        len(value) == generated_count
+        for value in (
+            generation_candidate_seeds,
+            generation_initialization_metadata,
+            generation_rng_digests,
+            generation_filter_diagnostics,
+        )
+    ):
+        raise RuntimeError("generated candidate provenance is internally inconsistent")
+    if len(set(generation_candidate_seeds)) != len(generation_candidate_seeds):
+        raise RuntimeError("generation seeds are not unique within the scene")
+
+    selection_seed = _stable_seed(production["selection_seed"], record.scene_id)
+    collision_model_manifest = collision_model.to_manifest()
+    generation_clamp_diagnostics.sort(key=_generation_clamp_diagnostic_sort_key)
+    raw = {
+        "schema_version": FILTERED_RAW_SCHEMA_VERSION,
+        "scene": record.to_manifest(),
+        "stage_names": list(STAGE_NAMES),
+        "dro_q_names": list(DRO_SHADOW_Q_NAMES),
+        "point_seed": scene_point_seed,
+        "object_point_cloud": points,
+        "object_point_cloud_sha256": sha256_array(points),
+        "initialization_mode": resolved["initialization"]["mode"],
+        "palm_fk": palm_fk,
+        "production_mode": production["mode"],
+        "production_config": production,
+        "tabletop_collision_model": collision_model_manifest,
+        "generation_candidate_sources": generation_sources,
+        "generation_candidate_seeds": generation_candidate_seeds,
+        "generation_released_initial_q": generated["released_initial_q"],
+        "generation_initial_q": generated["initial_q"],
+        "generation_initialization_metadata": generation_initialization_metadata,
+        "generation_pre_network_rng_state_sha256": generation_rng_digests,
+        "generation_stage_q": generated["stage_q"],
+        "generation_export_stage_q": generated["export_stage_q"],
+        "generation_timing_seconds": generated["timing_seconds"],
+        "generation_candidate_failures": generation_candidate_failures,
+        "generation_export_clamp_diagnostics": generation_clamp_diagnostics,
+        "generation_filter_diagnostics": generation_filter_diagnostics,
+        "generation_valid_indices": valid_generation_indices,
+        "batch_summaries": batch_summaries,
+        "generated_candidate_count": generated_count,
+        "valid_candidate_count": len(valid_generation_indices),
+        "selection_seed": selection_seed,
+    }
+    summary = {
+        "batch_count": len(batch_summaries),
+        "generated_candidate_count": generated_count,
+        "valid_candidate_count": len(valid_generation_indices),
+        "table_rejected_candidate_count": sum(
+            item["status"] == "table_rejected"
+            for item in generation_filter_diagnostics
+        ),
+        "inference_failed_candidate_count": sum(
+            item["status"] == "inference_failed"
+            for item in generation_filter_diagnostics
+        ),
+        "selection_seed": selection_seed,
+        "batch_summaries": batch_summaries,
+    }
+
+    if fatal_failure is not None:
+        return None, raw, fatal_failure, summary
+    if len(valid_generation_indices) < target_count:
+        scene_failure = {
+            "scene_id": record.scene_id,
+            "stage": "tabletop_filter_max_batches",
+            "max_batches": production["max_batches"],
+            "generated_candidate_count": generated_count,
+            "valid_candidate_count": len(valid_generation_indices),
+            "target_count": target_count,
+            "policy": resolved["failure_policy"],
+        }
+        return None, raw, scene_failure, summary
+
+    rng = np.random.default_rng(selection_seed)
+    selected_generation_indices = rng.choice(
+        np.asarray(valid_generation_indices, dtype=np.int64),
+        size=target_count,
+        replace=False,
+    ).tolist()
+    selected_sources = [generation_sources[index] for index in selected_generation_indices]
+    selected_stage_q = generated["stage_q"][selected_generation_indices]
+    export_started = time.perf_counter()
+    try:
+        selected_export_q, selected_clamp_diagnostics = clamp_dro_shadow_export_stages(
+            selected_stage_q, shadow_finger_joint_limits
+        )
+        palm_object_transforms = dro_stage_q_to_object_palm_transforms(
+            palm_fk_chain, selected_export_q
+        )
+        artifact, limit_excess = make_bench_artifact(
+            selected_export_q,
+            record.object_pose_wxyz,
+            record.stored_scene_path,
+            palm_object_transforms=palm_object_transforms,
+        )
+        validate_artifact(
+            artifact,
+            record,
+            selected_export_q,
+            palm_object_transforms=palm_object_transforms,
+        )
+    except Exception as error:
+        scene_failure = {
+            "scene_id": record.scene_id,
+            "stage": "export_validation",
+            "candidate_count": target_count,
+            "error_type": type(error).__name__,
+            "message": str(error),
+            "policy": resolved["failure_policy"],
+        }
+        return None, raw, scene_failure, summary
+
+    raw.update(
+        {
+            "selected_source_indices": selected_generation_indices,
+            "selected_candidate_sources": selected_sources,
+            "selected_proposal_indices": [
+                item["proposal_index"] for item in selected_sources
+            ],
+            "candidate_seeds": [
+                generation_candidate_seeds[index]
+                for index in selected_generation_indices
+            ],
+            "released_initial_q": generated["released_initial_q"][
+                selected_generation_indices
+            ],
+            "initial_q": generated["initial_q"][selected_generation_indices],
+            "initialization_metadata": [
+                generation_initialization_metadata[index]
+                for index in selected_generation_indices
+            ],
+            "pre_network_rng_state_sha256": [
+                generation_rng_digests[index] for index in selected_generation_indices
+            ],
+            "stage_q": selected_stage_q,
+            "export_stage_q": selected_export_q,
+            "export_clamp_diagnostics": selected_clamp_diagnostics,
+            "timing_seconds": generated["timing_seconds"][selected_generation_indices],
+            "failed_candidate_indices": [],
+            "bench_joint_limit_excess": limit_excess,
+            "export_seconds": time.perf_counter() - export_started,
+        }
+    )
+    summary["selected_source_indices"] = selected_generation_indices
+    summary["selected_candidate_sources"] = selected_sources
+    return artifact, raw, None, summary
+
+
 def run(repo_root: Path, config: dict, inference=None) -> dict:
     """Run isolated inference and write only scene-atomic valid Bench artifacts."""
 
@@ -633,6 +1156,16 @@ def run(repo_root: Path, config: dict, inference=None) -> dict:
     output_root = Path(output_value)
     if output_root.exists():
         raise FileExistsError(f"output_root already exists: {output_root}")
+    filtered_production = resolved["production"]["mode"] == "tabletop_filtered"
+    run_schema_version = (
+        FILTERED_RUN_SCHEMA_VERSION if filtered_production else RUN_SCHEMA_VERSION
+    )
+    collision_model = None
+    if filtered_production:
+        collision_model = TabletopCollisionModel.from_urdf(
+            Path(resolved["shadow_urdf"]),
+            root_link=resolved["production"]["filter_root_link"],
+        )
     if inference is None:
         # Initialize before creating an output directory so a missing CUDA/runtime
         # dependency cannot leave a misleading partial run behind.
@@ -640,10 +1173,15 @@ def run(repo_root: Path, config: dict, inference=None) -> dict:
     shadow_urdf = Path(resolved["shadow_urdf"])
     palm_fk_chain = _resolve_palm_fk_chain(inference, shadow_urdf)
     palm_fk = _palm_fk_manifest(shadow_urdf, palm_fk_chain)
+    collision_fk_chain = (
+        build_dro_shadow_pk_chain(shadow_urdf, device="cpu")
+        if filtered_production
+        else None
+    )
     output_root.mkdir(parents=True)
 
     manifest = {
-        "schema_version": RUN_SCHEMA_VERSION,
+        "schema_version": run_schema_version,
         "status": "running",
         "started_at": utc_now(),
         "source": git_state(repo_root),
@@ -655,6 +1193,7 @@ def run(repo_root: Path, config: dict, inference=None) -> dict:
         "palm_fk": palm_fk,
         "resolved_config": resolved,
         "initialization_mode": resolved["initialization"]["mode"],
+        "production_mode": resolved["production"]["mode"],
         "scene_count": len(records),
         "source_scene_count": len(source_records),
         "source_scene_manifest_sha256": scene_manifest_sha256(source_records),
@@ -664,7 +1203,17 @@ def run(repo_root: Path, config: dict, inference=None) -> dict:
         "failed_candidate_count": 0,
         "scenes": [],
     }
-    failure_manifest = {"schema_version": RUN_SCHEMA_VERSION, "failures": []}
+    if filtered_production:
+        manifest.update(
+            {
+                "tabletop_collision_model": collision_model.to_manifest(),
+                "generated_candidate_count": 0,
+                "table_collision_free_candidate_count": 0,
+                "table_rejected_candidate_count": 0,
+                "inference_failed_generation_candidate_count": 0,
+            }
+        )
+    failure_manifest = {"schema_version": run_schema_version, "failures": []}
     _atomic_json(output_root / "resolved_config.json", resolved)
     _atomic_json(output_root / "run_manifest.json", manifest)
     _atomic_json(output_root / "failure_manifest.json", failure_manifest)
@@ -683,11 +1232,72 @@ def run(repo_root: Path, config: dict, inference=None) -> dict:
                 resolved["point_count"],
                 scene_point_seed,
             )
+            grasp_path, raw_path, failed_raw_path = _artifact_paths(
+                output_root, record.scene_id
+            )
+            if filtered_production:
+                artifact, raw, scene_failure, production_summary = (
+                    _run_tabletop_filtered_scene(
+                        record=record,
+                        points=points,
+                        scene_point_seed=scene_point_seed,
+                        resolved=resolved,
+                        inference=inference,
+                        palm_fk_chain=palm_fk_chain,
+                        collision_fk_chain=collision_fk_chain,
+                        palm_fk=palm_fk,
+                        shadow_finger_joint_limits=shadow_finger_joint_limits,
+                        collision_model=collision_model,
+                    )
+                )
+                scene_record = record.to_manifest()
+                scene_record.update(
+                    {
+                        "point_seed": scene_point_seed,
+                        "point_cloud_sha256": raw["object_point_cloud_sha256"],
+                        "production": production_summary,
+                    }
+                )
+                manifest["generated_candidate_count"] += production_summary[
+                    "generated_candidate_count"
+                ]
+                manifest["table_collision_free_candidate_count"] += (
+                    production_summary["valid_candidate_count"]
+                )
+                manifest["table_rejected_candidate_count"] += production_summary[
+                    "table_rejected_candidate_count"
+                ]
+                manifest["inference_failed_generation_candidate_count"] += (
+                    production_summary["inference_failed_candidate_count"]
+                )
+                if scene_failure is None:
+                    _write_scene_pair(grasp_path, raw_path, artifact, raw)
+                    manifest["completed_candidate_count"] += resolved["candidate_count"]
+                    scene_record["status"] = "completed"
+                    scene_record["candidate_seeds"] = raw["candidate_seeds"]
+                    scene_record["grasp_artifact"] = str(
+                        grasp_path.relative_to(output_root)
+                    )
+                    scene_record["raw_artifact"] = str(raw_path.relative_to(output_root))
+                else:
+                    manifest["failed_candidate_count"] += resolved["candidate_count"]
+                    scene_record["status"] = "failed"
+                    failure_manifest["failures"].append(scene_failure)
+                    raw["scene_failure"] = scene_failure
+                    raw.setdefault("export_seconds", None)
+                    _atomic_numpy(failed_raw_path, raw)
+                    scene_record["failed_raw_artifact"] = str(
+                        failed_raw_path.relative_to(output_root)
+                    )
+                manifest["scenes"].append(scene_record)
+                _atomic_json(output_root / "run_manifest.json", manifest)
+                _atomic_json(output_root / "failure_manifest.json", failure_manifest)
+                continue
+
             candidate_seeds = [
                 _stable_seed(resolved["inference_seed"], f"{record.scene_id}:{index}")
                 for index in range(resolved["candidate_count"])
             ]
-            grasp_path, raw_path, failed_raw_path = _artifact_paths(output_root, record.scene_id)
             scene_failure = None
             try:
                 result = inference(record, points, candidate_seeds)
@@ -858,6 +1468,8 @@ def _validate_v2_initialization_raw(
     candidate_count: int,
     *,
     require_all: bool,
+    field_prefix: str = "",
+    proposal_indices: list[int] | None = None,
 ) -> None:
     """Validate persisted released/effective q and reproducible proposal evidence."""
 
@@ -867,21 +1479,33 @@ def _validate_v2_initialization_raw(
     mode = resolved_initialization.get("mode")
     if mode not in INITIALIZATION_MODES or raw.get("initialization_mode") != mode:
         raise ValueError(f"initialization mode mismatch for {record.scene_id}")
-    released_initial_q = np.asarray(raw.get("released_initial_q"))
-    initial_q = np.asarray(raw.get("initial_q"))
+    released_initial_q = np.asarray(raw.get(f"{field_prefix}released_initial_q"))
+    initial_q = np.asarray(raw.get(f"{field_prefix}initial_q"))
     expected_shape = (candidate_count, len(DRO_SHADOW_Q_NAMES))
     if released_initial_q.shape != expected_shape or initial_q.shape != expected_shape:
         raise ValueError(f"initial q evidence shape mismatch for {record.scene_id}")
-    metadata_values = raw.get("initialization_metadata")
-    rng_values = raw.get("pre_network_rng_state_sha256")
-    candidate_seeds = raw.get("candidate_seeds")
+    metadata_values = raw.get(f"{field_prefix}initialization_metadata")
+    rng_values = raw.get(f"{field_prefix}pre_network_rng_state_sha256")
+    candidate_seeds = raw.get(f"{field_prefix}candidate_seeds")
     if not all(
         isinstance(value, list) and len(value) == candidate_count
         for value in (metadata_values, rng_values, candidate_seeds)
     ):
         raise ValueError(f"initialization evidence length mismatch for {record.scene_id}")
+    if proposal_indices is None:
+        proposal_indices = list(range(candidate_count))
+    if (
+        not isinstance(proposal_indices, list)
+        or len(proposal_indices) != candidate_count
+        or any(
+            not isinstance(index, int) or isinstance(index, bool) or index < 0
+            for index in proposal_indices
+        )
+    ):
+        raise ValueError(f"proposal index evidence mismatch for {record.scene_id}")
 
     for candidate_index in range(candidate_count):
+        proposal_index = proposal_indices[candidate_index]
         metadata = metadata_values[candidate_index]
         rng_digests = rng_values[candidate_index]
         has_evidence = isinstance(metadata, dict) and isinstance(rng_digests, dict)
@@ -898,7 +1522,7 @@ def _validate_v2_initialization_raw(
                 f"non-finite initialization evidence for {record.scene_id}:{candidate_index}"
             )
         expected_q, expected_metadata = apply_initialization(
-            released_q, record, candidate_index, resolved_initialization
+            released_q, record, proposal_index, resolved_initialization
         )
         expected_metadata["candidate_seed"] = candidate_seeds[candidate_index]
         if not np.array_equal(effective_q, expected_q):
@@ -945,6 +1569,306 @@ def _validate_v2_initialization_raw(
             )
 
 
+def _validate_v3_filtered_raw(
+    raw: dict,
+    record,
+    resolved: dict,
+    candidate_count: int,
+    *,
+    collision_fk_chain,
+    collision_model: TabletopCollisionModel,
+    shadow_finger_joint_limits: dict,
+    require_selected: bool,
+) -> None:
+    """Independently validate generated, filtered, and selected v3 provenance."""
+
+    production = resolved.get("production")
+    if (
+        not isinstance(production, dict)
+        or production.get("mode") != "tabletop_filtered"
+        or raw.get("production_mode") != "tabletop_filtered"
+        or raw.get("production_config") != production
+    ):
+        raise ValueError(f"filtered production config mismatch for {record.scene_id}")
+    if raw.get("tabletop_collision_model") != collision_model.to_manifest():
+        raise ValueError(f"collision model provenance mismatch for {record.scene_id}")
+
+    generated_count = raw.get("generated_candidate_count")
+    if not isinstance(generated_count, int) or isinstance(generated_count, bool):
+        raise ValueError(f"generated candidate count is invalid for {record.scene_id}")
+    sources = raw.get("generation_candidate_sources")
+    seeds = raw.get("generation_candidate_seeds")
+    metadata = raw.get("generation_initialization_metadata")
+    rng_digests = raw.get("generation_pre_network_rng_state_sha256")
+    filter_diagnostics = raw.get("generation_filter_diagnostics")
+    if not all(
+        isinstance(value, list) and len(value) == generated_count
+        for value in (sources, seeds, metadata, rng_digests, filter_diagnostics)
+    ):
+        raise ValueError(f"generated list provenance mismatch for {record.scene_id}")
+
+    proposal_indices = []
+    for generation_index, source in enumerate(sources):
+        if not isinstance(source, dict):
+            raise ValueError(f"candidate source is invalid for {record.scene_id}")
+        expected_batch = generation_index // production["batch_size"]
+        expected_candidate = generation_index % production["batch_size"]
+        expected_group = expected_candidate // production["generation_group_size"]
+        expected_proposal = expected_candidate % production["generation_group_size"]
+        expected_seed = _stable_seed(
+            resolved["inference_seed"],
+            (
+                f"{record.scene_id}:batch:{expected_batch}:"
+                f"candidate:{expected_candidate}"
+            ),
+        )
+        expected_source = _source_record(
+            generation_index=generation_index,
+            batch_index=expected_batch,
+            batch_candidate_index=expected_candidate,
+            group_index=expected_group,
+            proposal_index=expected_proposal,
+            generation_seed=expected_seed,
+        )
+        if source != expected_source or seeds[generation_index] != expected_seed:
+            raise ValueError(f"candidate source identity mismatch for {record.scene_id}")
+        proposal_indices.append(expected_proposal)
+    if len(set(seeds)) != len(seeds):
+        raise ValueError(f"generation seeds are not unique for {record.scene_id}")
+
+    q_count = len(DRO_SHADOW_Q_NAMES)
+    generated_released_q = np.asarray(raw.get("generation_released_initial_q"))
+    generated_initial_q = np.asarray(raw.get("generation_initial_q"))
+    generated_stage_q = np.asarray(raw.get("generation_stage_q"))
+    generated_export_q = np.asarray(raw.get("generation_export_stage_q"))
+    generated_timings = np.asarray(raw.get("generation_timing_seconds"))
+    if (
+        generated_released_q.shape != (generated_count, q_count)
+        or generated_initial_q.shape != (generated_count, q_count)
+        or generated_stage_q.shape
+        != (generated_count, len(STAGE_NAMES), q_count)
+        or generated_export_q.shape != generated_stage_q.shape
+        or generated_timings.shape != (generated_count,)
+    ):
+        raise ValueError(f"generated array shape mismatch for {record.scene_id}")
+
+    candidate_failures = raw.get("generation_candidate_failures")
+    if not isinstance(candidate_failures, list):
+        raise ValueError(f"candidate failure provenance mismatch for {record.scene_id}")
+    failed_indices = []
+    for failure in candidate_failures:
+        generation_index = failure.get("generation_index") if isinstance(failure, dict) else None
+        if (
+            not isinstance(generation_index, int)
+            or generation_index < 0
+            or generation_index >= generated_count
+            or generation_index in failed_indices
+        ):
+            raise ValueError(f"candidate failure index mismatch for {record.scene_id}")
+        source = sources[generation_index]
+        if any(failure.get(key) != value for key, value in source.items()):
+            raise ValueError(f"candidate failure source mismatch for {record.scene_id}")
+        failed_indices.append(generation_index)
+    failed_index_set = set(failed_indices)
+    successful_indices = [
+        index for index in range(generated_count) if index not in failed_index_set
+    ]
+    if successful_indices:
+        for value, label in (
+            (generated_released_q, "released initial q"),
+            (generated_initial_q, "initial q"),
+            (generated_stage_q, "stage q"),
+            (generated_export_q, "export stage q"),
+            (generated_timings, "timings"),
+        ):
+            if not np.isfinite(value[successful_indices]).all():
+                raise ValueError(f"generated {label} is non-finite for {record.scene_id}")
+    if failed_indices and not np.isnan(generated_export_q[failed_indices]).all():
+        raise ValueError(f"failed candidates have exported q for {record.scene_id}")
+
+    successful_raw = {
+        "initialization_mode": raw.get("initialization_mode"),
+        "candidate_seeds": [seeds[index] for index in successful_indices],
+        "released_initial_q": generated_released_q[successful_indices],
+        "initial_q": generated_initial_q[successful_indices],
+        "initialization_metadata": [metadata[index] for index in successful_indices],
+        "pre_network_rng_state_sha256": [
+            rng_digests[index] for index in successful_indices
+        ],
+    }
+    _validate_v2_initialization_raw(
+        successful_raw,
+        record,
+        resolved,
+        len(successful_indices),
+        require_all=True,
+        proposal_indices=[proposal_indices[index] for index in successful_indices],
+    )
+
+    expected_generation_clamp_diagnostics = []
+    if successful_indices:
+        expected_export_q, expected_clamp = clamp_dro_shadow_export_stages(
+            generated_stage_q[successful_indices], shadow_finger_joint_limits
+        )
+        if not np.array_equal(
+            generated_export_q[successful_indices], expected_export_q
+        ):
+            raise ValueError(f"generated export clamp mismatch for {record.scene_id}")
+        for diagnostic in expected_clamp:
+            subset_index = diagnostic["candidate_index"]
+            generation_index = successful_indices[subset_index]
+            remapped = dict(diagnostic)
+            remapped.update(sources[generation_index])
+            expected_generation_clamp_diagnostics.append(remapped)
+    persisted_generation_clamp_diagnostics = raw.get(
+        "generation_export_clamp_diagnostics"
+    )
+    if not isinstance(persisted_generation_clamp_diagnostics, list):
+        raise ValueError(f"generated clamp diagnostics mismatch for {record.scene_id}")
+    try:
+        persisted_generation_clamp_diagnostics = sorted(
+            persisted_generation_clamp_diagnostics,
+            key=_generation_clamp_diagnostic_sort_key,
+        )
+        expected_generation_clamp_diagnostics.sort(
+            key=_generation_clamp_diagnostic_sort_key
+        )
+    except (KeyError, TypeError):
+        raise ValueError(
+            f"generated clamp diagnostics mismatch for {record.scene_id}"
+        ) from None
+    if (
+        persisted_generation_clamp_diagnostics
+        != expected_generation_clamp_diagnostics
+    ):
+        raise ValueError(f"generated clamp diagnostics mismatch for {record.scene_id}")
+
+    expected_filter_diagnostics = [None] * generated_count
+    for generation_index in failed_indices:
+        expected_filter_diagnostics[generation_index] = {
+            **sources[generation_index],
+            "status": "inference_failed",
+            "passed": False,
+            "min_z": None,
+            "margin": production["table_margin"],
+            "worst_link": None,
+            "worst_collision_index": None,
+            "worst_geometry_type": None,
+        }
+    if successful_indices:
+        passed, expected_collision = collision_model.evaluate_final_grasps(
+            collision_fk_chain,
+            generated_export_q[successful_indices, STAGE_NAMES.index("grasp"), :],
+            record,
+            margin=production["table_margin"],
+        )
+        for subset_index, diagnostic in enumerate(expected_collision):
+            generation_index = successful_indices[subset_index]
+            remapped = dict(diagnostic)
+            remapped.update(sources[generation_index])
+            expected_filter_diagnostics[generation_index] = remapped
+    else:
+        passed = np.zeros((0,), dtype=bool)
+    if filter_diagnostics != expected_filter_diagnostics:
+        raise ValueError(f"table filter diagnostics mismatch for {record.scene_id}")
+    valid_indices = [
+        successful_indices[index]
+        for index in range(len(successful_indices))
+        if passed[index]
+    ]
+    if raw.get("generation_valid_indices") != valid_indices:
+        raise ValueError(f"valid candidate indices mismatch for {record.scene_id}")
+    if raw.get("valid_candidate_count") != len(valid_indices):
+        raise ValueError(f"valid candidate count mismatch for {record.scene_id}")
+
+    expected_batch_summaries = []
+    cumulative_valid = 0
+    for batch_index, batch_start in enumerate(
+        range(0, generated_count, production["batch_size"])
+    ):
+        batch_items = expected_filter_diagnostics[
+            batch_start : batch_start + production["batch_size"]
+        ]
+        cumulative_valid += sum(
+            item["status"] == "table_collision_free" for item in batch_items
+        )
+        expected_batch_summaries.append(
+            {
+                "batch_index": batch_index,
+                "generated_count": len(batch_items),
+                "table_collision_free_count": sum(
+                    item["status"] == "table_collision_free" for item in batch_items
+                ),
+                "table_rejected_count": sum(
+                    item["status"] == "table_rejected" for item in batch_items
+                ),
+                "inference_failed_count": sum(
+                    item["status"] == "inference_failed" for item in batch_items
+                ),
+                "cumulative_valid_count": cumulative_valid,
+            }
+        )
+    if raw.get("batch_summaries") != expected_batch_summaries:
+        raise ValueError(f"batch summaries mismatch for {record.scene_id}")
+
+    expected_selection_seed = _stable_seed(production["selection_seed"], record.scene_id)
+    if raw.get("selection_seed") != expected_selection_seed:
+        raise ValueError(f"selection seed mismatch for {record.scene_id}")
+    if not require_selected:
+        return
+
+    selected_indices = raw.get("selected_source_indices")
+    if (
+        not isinstance(selected_indices, list)
+        or len(selected_indices) != candidate_count
+        or len(set(selected_indices)) != candidate_count
+        or any(index not in valid_indices for index in selected_indices)
+    ):
+        raise ValueError(f"selected source indices mismatch for {record.scene_id}")
+    expected_selected = np.random.default_rng(expected_selection_seed).choice(
+        np.asarray(valid_indices, dtype=np.int64),
+        size=candidate_count,
+        replace=False,
+    ).tolist()
+    if selected_indices != expected_selected:
+        raise ValueError(f"random selection is not reproducible for {record.scene_id}")
+    selected_sources = [sources[index] for index in selected_indices]
+    if raw.get("selected_candidate_sources") != selected_sources:
+        raise ValueError(f"selected source provenance mismatch for {record.scene_id}")
+    selected_proposals = [source["proposal_index"] for source in selected_sources]
+    if raw.get("selected_proposal_indices") != selected_proposals:
+        raise ValueError(f"selected proposal provenance mismatch for {record.scene_id}")
+
+    selected_fields = (
+        ("released_initial_q", generated_released_q),
+        ("initial_q", generated_initial_q),
+        ("stage_q", generated_stage_q),
+        ("export_stage_q", generated_export_q),
+        ("timing_seconds", generated_timings),
+    )
+    for field, generated_value in selected_fields:
+        if not np.array_equal(
+            np.asarray(raw.get(field)), generated_value[selected_indices]
+        ):
+            raise ValueError(f"selected {field} mismatch for {record.scene_id}")
+    if raw.get("candidate_seeds") != [seeds[index] for index in selected_indices]:
+        raise ValueError(f"selected candidate seeds mismatch for {record.scene_id}")
+    if raw.get("initialization_metadata") != [
+        metadata[index] for index in selected_indices
+    ] or raw.get("pre_network_rng_state_sha256") != [
+        rng_digests[index] for index in selected_indices
+    ]:
+        raise ValueError(f"selected initialization provenance mismatch for {record.scene_id}")
+    _validate_v2_initialization_raw(
+        raw,
+        record,
+        resolved,
+        candidate_count,
+        require_all=True,
+        proposal_indices=selected_proposals,
+    )
+
+
 def validate_run_outputs(output_root: Path) -> dict:
     """Independently revalidate persisted raw/artifact pairs and accounting."""
 
@@ -968,13 +1892,22 @@ def validate_run_outputs(output_root: Path) -> dict:
         raise ValueError("failure manifest and scene statuses disagree")
 
     resolved = manifest["resolved_config"]
-    if run_schema_version == RUN_SCHEMA_VERSION:
+    filtered_run = run_schema_version == FILTERED_RUN_SCHEMA_VERSION
+    if run_schema_version in (RUN_SCHEMA_VERSION, FILTERED_RUN_SCHEMA_VERSION):
         initialization = resolved.get("initialization")
         if (
             not isinstance(initialization, dict)
             or manifest.get("initialization_mode") != initialization.get("mode")
         ):
             raise ValueError("run manifest initialization mode does not match config")
+    if filtered_run:
+        production = resolved.get("production")
+        if (
+            not isinstance(production, dict)
+            or production.get("mode") != "tabletop_filtered"
+            or manifest.get("production_mode") != "tabletop_filtered"
+        ):
+            raise ValueError("filtered run production mode does not match config")
     shadow_finger_joint_limits = load_dro_shadow_finger_joint_limits(
         Path(resolved["shadow_urdf"])
     )
@@ -985,6 +1918,19 @@ def validate_run_outputs(output_root: Path) -> dict:
     else:
         _validate_palm_fk_manifest(persisted_palm_fk, shadow_urdf)
         palm_fk_chain = build_dro_shadow_pk_chain(shadow_urdf, device="cpu")
+    if filtered_run:
+        if palm_fk_chain is None:
+            raise ValueError("filtered run requires persisted palm FK provenance")
+        collision_model = TabletopCollisionModel.from_urdf(
+            shadow_urdf,
+            root_link=resolved["production"]["filter_root_link"],
+        )
+        if manifest.get("tabletop_collision_model") != collision_model.to_manifest():
+            raise ValueError("run manifest collision model provenance mismatch")
+        collision_fk_chain = build_dro_shadow_pk_chain(shadow_urdf, device="cpu")
+    else:
+        collision_model = None
+        collision_fk_chain = None
     source_records, selected_records = resolve_scene_records(
         resolved,
         include_table_in_manifest=(run_schema_version != LEGACY_RUN_SCHEMA_VERSION),
@@ -1009,6 +1955,10 @@ def validate_run_outputs(output_root: Path) -> dict:
     candidate_count = resolved["candidate_count"]
     completed_scenes = 0
     failed_scenes = 0
+    generated_candidate_count = 0
+    valid_generation_count = 0
+    table_rejected_count = 0
+    inference_failed_generation_count = 0
     for scene in manifest["scenes"]:
         scene_path = scene_root / (scene["scene_id"] + ".npy")
         record = load_scene_record(scene_path, scene_root)
@@ -1020,6 +1970,8 @@ def validate_run_outputs(output_root: Path) -> dict:
             expected_raw_schema = (
                 LEGACY_RAW_SCHEMA_VERSION
                 if run_schema_version == LEGACY_RUN_SCHEMA_VERSION
+                else FILTERED_RAW_SCHEMA_VERSION
+                if filtered_run
                 else RAW_SCHEMA_VERSION
             )
             if raw.get("schema_version") != expected_raw_schema:
@@ -1060,12 +2012,24 @@ def validate_run_outputs(output_root: Path) -> dict:
                 raise ValueError(f"initial q shape mismatch for {record.scene_id}")
             if not np.isfinite(initial_q).all():
                 raise ValueError(f"initial q contains non-finite values for {record.scene_id}")
-            if run_schema_version == RUN_SCHEMA_VERSION:
+            if run_schema_version in (RUN_SCHEMA_VERSION, FILTERED_RUN_SCHEMA_VERSION):
                 if raw.get("scene") != record.to_manifest():
                     raise ValueError(f"table scene provenance mismatch for {record.scene_id}")
-                _validate_v2_initialization_raw(
-                    raw, record, resolved, candidate_count, require_all=True
-                )
+                if filtered_run:
+                    _validate_v3_filtered_raw(
+                        raw,
+                        record,
+                        resolved,
+                        candidate_count,
+                        collision_fk_chain=collision_fk_chain,
+                        collision_model=collision_model,
+                        shadow_finger_joint_limits=shadow_finger_joint_limits,
+                        require_selected=True,
+                    )
+                else:
+                    _validate_v2_initialization_raw(
+                        raw, record, resolved, candidate_count, require_all=True
+                    )
             if timings.shape != (candidate_count,) or not np.isfinite(timings).all():
                 raise ValueError(f"timing contract mismatch for {record.scene_id}")
             if raw.get("failed_candidate_indices") != []:
@@ -1092,7 +2056,12 @@ def validate_run_outputs(output_root: Path) -> dict:
                 persisted_excess, expected_excess
             ):
                 raise ValueError(f"joint-limit diagnostics mismatch for {record.scene_id}")
-            if not np.array_equal(artifact["robot_pose"], expected_artifact["robot_pose"]):
+            if not np.allclose(
+                artifact["robot_pose"],
+                expected_artifact["robot_pose"],
+                rtol=0.0,
+                atol=1e-6,
+            ):
                 raise ValueError(f"artifact export mismatch for {record.scene_id}")
             validate_artifact(
                 artifact,
@@ -1100,6 +2069,17 @@ def validate_run_outputs(output_root: Path) -> dict:
                 export_stage_q,
                 palm_object_transforms=palm_object_transforms,
             )
+            if filtered_run:
+                generated_candidate_count += raw["generated_candidate_count"]
+                valid_generation_count += raw["valid_candidate_count"]
+                table_rejected_count += sum(
+                    item["status"] == "table_rejected"
+                    for item in raw["generation_filter_diagnostics"]
+                )
+                inference_failed_generation_count += sum(
+                    item["status"] == "inference_failed"
+                    for item in raw["generation_filter_diagnostics"]
+                )
             completed_scenes += 1
         elif scene["status"] == "failed":
             failed_raw_path = output_root / scene["failed_raw_artifact"]
@@ -1107,22 +2087,58 @@ def validate_run_outputs(output_root: Path) -> dict:
             expected_raw_schema = (
                 LEGACY_RAW_SCHEMA_VERSION
                 if run_schema_version == LEGACY_RUN_SCHEMA_VERSION
+                else FILTERED_RAW_SCHEMA_VERSION
+                if filtered_run
                 else RAW_SCHEMA_VERSION
             )
             if raw.get("schema_version") != expected_raw_schema or "scene_failure" not in raw:
                 raise ValueError(f"failed raw diagnostics are incomplete for {record.scene_id}")
             if persisted_palm_fk is not None and raw.get("palm_fk") != persisted_palm_fk:
                 raise ValueError(f"palm FK provenance mismatch for {record.scene_id}")
-            if run_schema_version == RUN_SCHEMA_VERSION:
+            if run_schema_version in (RUN_SCHEMA_VERSION, FILTERED_RUN_SCHEMA_VERSION):
                 if raw.get("scene") != record.to_manifest():
                     raise ValueError(f"table scene provenance mismatch for {record.scene_id}")
-                _validate_v2_initialization_raw(
-                    raw, record, resolved, candidate_count, require_all=False
+                if filtered_run:
+                    _validate_v3_filtered_raw(
+                        raw,
+                        record,
+                        resolved,
+                        candidate_count,
+                        collision_fk_chain=collision_fk_chain,
+                        collision_model=collision_model,
+                        shadow_finger_joint_limits=shadow_finger_joint_limits,
+                        require_selected=False,
+                    )
+                else:
+                    _validate_v2_initialization_raw(
+                        raw, record, resolved, candidate_count, require_all=False
+                    )
+            if filtered_run:
+                generated_candidate_count += raw["generated_candidate_count"]
+                valid_generation_count += raw["valid_candidate_count"]
+                table_rejected_count += sum(
+                    item["status"] == "table_rejected"
+                    for item in raw["generation_filter_diagnostics"]
+                )
+                inference_failed_generation_count += sum(
+                    item["status"] == "inference_failed"
+                    for item in raw["generation_filter_diagnostics"]
                 )
             failed_scenes += 1
         else:
             raise ValueError(f"unknown scene status for {record.scene_id}: {scene['status']}")
-    return {
+    if filtered_run:
+        expected_counters = {
+            "generated_candidate_count": generated_candidate_count,
+            "table_collision_free_candidate_count": valid_generation_count,
+            "table_rejected_candidate_count": table_rejected_count,
+            "inference_failed_generation_candidate_count": (
+                inference_failed_generation_count
+            ),
+        }
+        if any(manifest.get(key) != value for key, value in expected_counters.items()):
+            raise ValueError("filtered run manifest generation accounting mismatch")
+    result = {
         "status": "valid",
         "scene_count": len(manifest["scenes"]),
         "completed_scene_count": completed_scenes,
@@ -1131,3 +2147,6 @@ def validate_run_outputs(output_root: Path) -> dict:
         "completed_candidate_count": manifest["completed_candidate_count"],
         "failed_candidate_count": manifest["failed_candidate_count"],
     }
+    if filtered_run:
+        result.update(expected_counters)
+    return result

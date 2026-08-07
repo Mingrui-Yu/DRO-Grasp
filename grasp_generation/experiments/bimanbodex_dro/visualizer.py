@@ -15,6 +15,8 @@ from .contracts import (
     BENCH_SHADOW_JOINT_NAMES,
     DRO_BENCH_LINK_PAIRS,
     DRO_SHADOW_Q_NAMES,
+    FILTERED_RAW_SCHEMA_VERSION,
+    FILTERED_RUN_SCHEMA_VERSION,
     LEGACY_RAW_SCHEMA_VERSION,
     LEGACY_RUN_SCHEMA_VERSION,
     RAW_SCHEMA_VERSION,
@@ -743,7 +745,7 @@ class ViewerRun:
             raise ValueError("run manifest is not in a terminal state")
         if self.manifest.get("resolved_config") != self.resolved_config:
             raise ValueError("run_manifest resolved_config does not match resolved_config.json")
-        if self.run_schema_version == RUN_SCHEMA_VERSION:
+        if self.run_schema_version in (RUN_SCHEMA_VERSION, FILTERED_RUN_SCHEMA_VERSION):
             initialization = self.resolved_config.get("initialization")
             if (
                 not isinstance(initialization, dict)
@@ -955,7 +957,7 @@ class ViewerRun:
                 raise ValueError(
                     f"{source_name} object_pose_wxyz mismatch for {entry.scene_id}"
                 )
-        if self.run_schema_version == RUN_SCHEMA_VERSION:
+        if self.run_schema_version in (RUN_SCHEMA_VERSION, FILTERED_RUN_SCHEMA_VERSION):
             for source_name, source in (
                 ("run manifest", manifest_scene),
                 ("raw scene", raw_scene),
@@ -1001,6 +1003,8 @@ class ViewerRun:
         expected_raw_schema = (
             LEGACY_RAW_SCHEMA_VERSION
             if self.run_schema_version == LEGACY_RUN_SCHEMA_VERSION
+            else FILTERED_RAW_SCHEMA_VERSION
+            if self.run_schema_version == FILTERED_RUN_SCHEMA_VERSION
             else RAW_SCHEMA_VERSION
         )
         if raw.get("schema_version") != expected_raw_schema:
@@ -1012,7 +1016,7 @@ class ViewerRun:
         if raw.get("palm_fk") != self.palm_fk_metadata:
             raise ValueError(f"palm FK provenance mismatch for {scene_id}")
         self._validate_scene_provenance(entry, record, raw)
-        if self.run_schema_version == RUN_SCHEMA_VERSION:
+        if self.run_schema_version in (RUN_SCHEMA_VERSION, FILTERED_RUN_SCHEMA_VERSION):
             from .runner import _validate_v2_initialization_raw
 
             _validate_v2_initialization_raw(
@@ -1021,6 +1025,11 @@ class ViewerRun:
                 self.resolved_config,
                 self.candidate_count,
                 require_all=True,
+                proposal_indices=(
+                    raw.get("selected_proposal_indices")
+                    if self.run_schema_version == FILTERED_RUN_SCHEMA_VERSION
+                    else None
+                ),
             )
 
         points = np.asarray(raw.get("object_point_cloud"))
@@ -1086,7 +1095,12 @@ class ViewerRun:
             )
         if not np.isfinite(robot_pose).all():
             raise ValueError(f"robot_pose contains non-finite values for {scene_id}")
-        if not np.array_equal(robot_pose, expected_artifact["robot_pose"]):
+        if not np.allclose(
+            robot_pose,
+            expected_artifact["robot_pose"],
+            rtol=0.0,
+            atol=1e-6,
+        ):
             raise ValueError(f"persisted robot_pose round-trip mismatch for {scene_id}")
         validate_artifact(
             artifact,

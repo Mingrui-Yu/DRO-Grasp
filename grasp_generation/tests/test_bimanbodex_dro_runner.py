@@ -14,6 +14,8 @@ import torch
 from grasp_generation.experiments.bimanbodex_dro.contracts import (
     DRO_SHADOW_FINGER_JOINT_NAMES,
     DRO_SHADOW_Q_NAMES,
+    FILTERED_RAW_SCHEMA_VERSION,
+    FILTERED_RUN_SCHEMA_VERSION,
     LEGACY_RAW_SCHEMA_VERSION,
     LEGACY_RUN_SCHEMA_VERSION,
     load_scene_record,
@@ -31,6 +33,7 @@ from grasp_generation.experiments.bimanbodex_dro.runner import (
     _batch_robot_point_cloud,
     _controller_stages_on_cpu,
     dry_run,
+    resolve_config,
     run,
     validate_run_outputs,
 )
@@ -125,6 +128,15 @@ class RunnerTests(unittest.TestCase):
         )
         for index, (joint_name, joint_type, axis) in enumerate(moving_joints):
             child = "palm" if joint_name == "WRJ1" else f"link_{index}"
+            collision = (
+                '<collision><origin xyz="0 0 0" rpy="0 0 0"/>'
+                '<geometry><box size="0.02 0.02 0.02"/></geometry></collision>'
+                if child == "palm"
+                else '<collision><origin xyz="0 1 0" rpy="0 0 0"/>'
+                '<geometry><box size="0.02 0.02 0.02"/></geometry></collision>'
+                if child == "link_8"
+                else ""
+            )
             origin = (
                 "0 -0.010 0.21301"
                 if joint_name == "WRJ2"
@@ -134,7 +146,7 @@ class RunnerTests(unittest.TestCase):
             )
             lines.extend(
                 (
-                    f'<link name="{child}"/>',
+                    f'<link name="{child}">{collision}</link>',
                     f'<joint name="{joint_name}" type="{joint_type}">',
                     f'<parent link="{parent}"/><child link="{child}"/>',
                     f'<origin xyz="{origin}" rpy="0 0 0"/>',
@@ -254,6 +266,80 @@ class RunnerTests(unittest.TestCase):
 
         return inference
 
+    @staticmethod
+    def filtered_inference(
+        pass_predicate,
+        failure_predicate=None,
+        initialization_mode="released_random",
+    ):
+        initialization = default_initialization_config()
+        initialization["mode"] = initialization_mode
+        resolved_initialization = resolve_initialization_config(initialization, 20)
+
+        class FilteredInference:
+            def __init__(self):
+                self.call_count = 0
+
+            def __call__(self, record, points, candidate_seeds):
+                result = RunnerTests.successful_inference(
+                    record, points, candidate_seeds
+                )
+                for proposal_index, candidate_seed in enumerate(candidate_seeds):
+                    effective_q, item = apply_initialization(
+                        result["released_initial_q"][proposal_index],
+                        record,
+                        proposal_index,
+                        resolved_initialization,
+                    )
+                    item["candidate_seed"] = candidate_seed
+                    result["initial_q"][proposal_index] = effective_q
+                    result["initialization_metadata"][proposal_index] = item
+                call_index = self.call_count
+                self.call_count += 1
+                batch_index = call_index // 5
+                group_index = call_index % 5
+                root_z = DRO_SHADOW_Q_NAMES.index("virtual_joint_z")
+                ffj4 = DRO_SHADOW_Q_NAMES.index("FFJ4")
+                result["stage_q"][:, :, root_z] = -1.0
+                result["stage_q"][:, 0, ffj4] = -0.3
+                result["stage_q"][:, 1, ffj4] = 0.0
+                result["stage_q"][:, 2, ffj4] = -0.3
+                for proposal_index in range(len(candidate_seeds)):
+                    batch_candidate_index = group_index * 20 + proposal_index
+                    if pass_predicate(batch_index, batch_candidate_index):
+                        result["stage_q"][proposal_index, :, root_z] = 0.0
+                    if failure_predicate is not None and failure_predicate(
+                        batch_index, batch_candidate_index
+                    ):
+                        result["stage_q"][proposal_index] = np.nan
+                        result["timing_seconds"][proposal_index] = np.nan
+                        result["failures"].append(
+                            {
+                                "candidate_index": proposal_index,
+                                "candidate_seed": candidate_seeds[proposal_index],
+                                "error_type": "RuntimeError",
+                                "message": "synthetic candidate failure",
+                            }
+                        )
+                return result
+
+        return FilteredInference()
+
+    def filtered_config(self, output_root, *, max_batches=2, selection_seed=91):
+        config = copy.deepcopy(self.config)
+        config["output_root"] = str(output_root)
+        config["production"] = {
+            "mode": "tabletop_filtered",
+            "batch_size": 100,
+            "target_count": 20,
+            "max_batches": max_batches,
+            "selection_seed": selection_seed,
+            "filter_stage": "grasp",
+            "filter_root_link": "palm",
+            "table_margin": 0.0,
+        }
+        return config
+
     def test_dry_run_resolves_contract_without_creating_output(self):
         output_root = self.root / "dry-output"
         self.config["output_root"] = str(output_root)
@@ -270,6 +356,27 @@ class RunnerTests(unittest.TestCase):
         self.config["expected_scene_count"] = 996
         with self.assertRaisesRegex(ValueError, "authoritative scene count mismatch"):
             dry_run(self.repo_root, self.config)
+
+    def test_filtered_production_requires_fixed_contract_controls(self):
+        base = self.filtered_config(self.root / "unused-output")
+        resolved = resolve_config(self.repo_root, base)
+        self.assertEqual(resolved["production"]["groups_per_batch"], 5)
+
+        invalid_values = (
+            ("max_batches", None, "explicit max_batches"),
+            ("selection_seed", None, "explicit selection_seed"),
+            ("batch_size", 99, "approved 100"),
+            ("target_count", 19, "match candidate_count"),
+            ("filter_stage", "pregrasp", "final grasp_qpos"),
+            ("filter_root_link", "wrist", "remain palm"),
+            ("table_margin", 0.001, "remain exactly 0"),
+        )
+        for name, value, message in invalid_values:
+            with self.subTest(name=name):
+                config = copy.deepcopy(base)
+                config["production"][name] = value
+                with self.assertRaisesRegex(ValueError, message):
+                    resolve_config(self.repo_root, config)
 
     def test_success_writes_shape_1_20_3_29_and_exact_accounting(self):
         output_root = self.root / "success-output"
@@ -303,6 +410,210 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(validation["completed_candidate_count"], 20)
         with self.assertRaises(FileExistsError):
             run(self.repo_root, self.config, self.successful_inference)
+
+    def test_filtered_production_randomly_selects_twenty_from_first_batch(self):
+        output_root = self.root / "filtered-random-output"
+        config = self.filtered_config(output_root, max_batches=2, selection_seed=101)
+        inference = self.filtered_inference(lambda _batch, _candidate: True)
+        manifest = run(self.repo_root, config, inference)
+        self.assertEqual(inference.call_count, 5)
+        self.assertEqual(manifest["schema_version"], FILTERED_RUN_SCHEMA_VERSION)
+        self.assertEqual(manifest["candidate_count"], 20)
+        self.assertEqual(manifest["completed_candidate_count"], 20)
+        self.assertEqual(manifest["generated_candidate_count"], 100)
+        self.assertEqual(manifest["table_collision_free_candidate_count"], 100)
+        self.assertEqual(manifest["table_rejected_candidate_count"], 0)
+
+        raw_path = output_root / "raw" / "object_a" / "floating" / "scale013.npy"
+        raw = np.load(raw_path, allow_pickle=True).item()
+        self.assertEqual(raw["schema_version"], FILTERED_RAW_SCHEMA_VERSION)
+        expected_selection = np.random.default_rng(raw["selection_seed"]).choice(
+            np.arange(100, dtype=np.int64), size=20, replace=False
+        ).tolist()
+        self.assertEqual(raw["selected_source_indices"], expected_selection)
+        self.assertEqual(len(set(expected_selection)), 20)
+        root_z = DRO_SHADOW_Q_NAMES.index("virtual_joint_z")
+        ffj4 = DRO_SHADOW_Q_NAMES.index("FFJ4")
+        np.testing.assert_array_equal(raw["stage_q"][:, 0, root_z], 0.0)
+        np.testing.assert_array_equal(raw["stage_q"][:, 1, root_z], 0.0)
+        np.testing.assert_array_equal(raw["stage_q"][:, 2, root_z], 0.0)
+        np.testing.assert_allclose(raw["stage_q"][:, 0, ffj4], -0.3)
+        np.testing.assert_array_equal(raw["stage_q"][:, 1, ffj4], 0.0)
+        np.testing.assert_allclose(raw["stage_q"][:, 2, ffj4], -0.3)
+        artifact_path = (
+            output_root
+            / "graspdata"
+            / "object_a"
+            / "floating"
+            / "scale013_grasp.npy"
+        )
+        artifact = np.load(artifact_path, allow_pickle=True).item()
+        self.assertEqual(artifact["robot_pose"].shape, (1, 20, 3, 29))
+
+        raw["generation_export_clamp_diagnostics"] = list(
+            reversed(raw["generation_export_clamp_diagnostics"])
+        )
+        np.save(raw_path, raw, allow_pickle=True)
+        original_pose_value = artifact["robot_pose"][0, 0, 0, 0]
+        artifact["robot_pose"][0, 0, 0, 0] = np.nextafter(
+            original_pose_value,
+            np.float32(np.inf),
+        )
+        self.assertGreater(
+            artifact["robot_pose"][0, 0, 0, 0], original_pose_value
+        )
+        self.assertLess(
+            float(artifact["robot_pose"][0, 0, 0, 0] - original_pose_value),
+            1e-6,
+        )
+        np.save(artifact_path, artifact, allow_pickle=True)
+        validation = validate_run_outputs(output_root)
+        self.assertEqual(validation["generated_candidate_count"], 100)
+        loaded = ViewerRun(output_root).load_scene("object_a/floating/scale013")
+        self.assertEqual(loaded.raw["schema_version"], FILTERED_RAW_SCHEMA_VERSION)
+
+    def test_filtered_production_continues_by_full_batches_until_twenty(self):
+        output_root = self.root / "filtered-repeat-output"
+        config = self.filtered_config(output_root, max_batches=2, selection_seed=102)
+        inference = self.filtered_inference(
+            lambda batch, candidate: (
+                (batch == 0 and candidate < 19)
+                or (batch == 1 and candidate == 0)
+            )
+        )
+        manifest = run(self.repo_root, config, inference)
+        self.assertEqual(inference.call_count, 10)
+        self.assertEqual(manifest["generated_candidate_count"], 200)
+        self.assertEqual(manifest["table_collision_free_candidate_count"], 20)
+        self.assertEqual(manifest["table_rejected_candidate_count"], 180)
+        raw_path = output_root / "raw" / "object_a" / "floating" / "scale013.npy"
+        raw = np.load(raw_path, allow_pickle=True).item()
+        self.assertEqual(
+            raw["batch_summaries"],
+            [
+                {
+                    "batch_index": 0,
+                    "generated_count": 100,
+                    "table_collision_free_count": 19,
+                    "table_rejected_count": 81,
+                    "inference_failed_count": 0,
+                    "cumulative_valid_count": 19,
+                },
+                {
+                    "batch_index": 1,
+                    "generated_count": 100,
+                    "table_collision_free_count": 1,
+                    "table_rejected_count": 99,
+                    "inference_failed_count": 0,
+                    "cumulative_valid_count": 20,
+                },
+            ],
+        )
+        self.assertEqual(set(raw["selected_source_indices"]), {*range(19), 100})
+        self.assertEqual(validate_run_outputs(output_root)["status"], "valid")
+
+    def test_filtered_production_max_batches_fails_without_relaxing_filter(self):
+        output_root = self.root / "filtered-max-batches-output"
+        config = self.filtered_config(output_root, max_batches=1, selection_seed=103)
+        inference = self.filtered_inference(lambda _batch, _candidate: False)
+        manifest = run(self.repo_root, config, inference)
+        self.assertEqual(inference.call_count, 5)
+        self.assertEqual(manifest["status"], "failed")
+        self.assertEqual(manifest["candidate_count"], 20)
+        self.assertEqual(manifest["completed_candidate_count"], 0)
+        self.assertEqual(manifest["failed_candidate_count"], 20)
+        self.assertEqual(manifest["generated_candidate_count"], 100)
+        self.assertEqual(manifest["table_collision_free_candidate_count"], 0)
+        self.assertFalse((output_root / "graspdata").exists())
+        failed_raw_path = (
+            output_root
+            / "failed_raw"
+            / "object_a"
+            / "floating"
+            / "scale013.npy"
+        )
+        raw = np.load(failed_raw_path, allow_pickle=True).item()
+        self.assertEqual(raw["scene_failure"]["stage"], "tabletop_filter_max_batches")
+        self.assertEqual(raw["generated_candidate_count"], 100)
+        self.assertEqual(raw["valid_candidate_count"], 0)
+        validation = validate_run_outputs(output_root)
+        self.assertEqual(validation["status"], "valid")
+        self.assertEqual(validation["failed_candidate_count"], 20)
+
+    def test_filtered_production_records_candidate_failures_and_still_selects(self):
+        output_root = self.root / "filtered-candidate-failures-output"
+        config = self.filtered_config(output_root, max_batches=1, selection_seed=104)
+        inference = self.filtered_inference(
+            lambda _batch, _candidate: True,
+            failure_predicate=lambda _batch, candidate: candidate % 20 == 19,
+        )
+        manifest = run(self.repo_root, config, inference)
+        self.assertEqual(manifest["status"], "completed")
+        self.assertEqual(manifest["generated_candidate_count"], 100)
+        self.assertEqual(manifest["table_collision_free_candidate_count"], 95)
+        self.assertEqual(manifest["inference_failed_generation_candidate_count"], 5)
+        raw_path = output_root / "raw" / "object_a" / "floating" / "scale013.npy"
+        raw = np.load(raw_path, allow_pickle=True).item()
+        self.assertEqual(len(raw["generation_candidate_failures"]), 5)
+        self.assertEqual(
+            {
+                item["generation_index"]
+                for item in raw["generation_candidate_failures"]
+            },
+            {19, 39, 59, 79, 99},
+        )
+        self.assertTrue(
+            all(
+                index not in {19, 39, 59, 79, 99}
+                for index in raw["selected_source_indices"]
+            )
+        )
+        validation = validate_run_outputs(output_root)
+        self.assertEqual(
+            validation["inference_failed_generation_candidate_count"], 5
+        )
+
+    def test_filtered_production_reuses_each_twenty_slot_initialization_group(self):
+        output_root = self.root / "filtered-tabletop-initialization-output"
+        config = self.filtered_config(output_root, max_batches=1, selection_seed=105)
+        config["initialization"] = default_initialization_config()
+        config["initialization"]["mode"] = "tabletop_stratified"
+        inference = self.filtered_inference(
+            lambda _batch, _candidate: True,
+            initialization_mode="tabletop_stratified",
+        )
+        run(self.repo_root, config, inference)
+        raw_path = output_root / "raw" / "object_a" / "floating" / "scale013.npy"
+        raw = np.load(raw_path, allow_pickle=True).item()
+        self.assertEqual(
+            [
+                raw["generation_candidate_sources"][index]["proposal_index"]
+                for index in (0, 20, 40, 60, 80)
+            ],
+            [0, 0, 0, 0, 0],
+        )
+        self.assertTrue(
+            all(
+                raw["generation_initialization_metadata"][index]["candidate_index"]
+                == index % 20
+                for index in range(100)
+            )
+        )
+        np.testing.assert_array_equal(
+            raw["generation_released_initial_q"][:, :3],
+            raw["generation_initial_q"][:, :3],
+        )
+        np.testing.assert_array_equal(
+            raw["generation_released_initial_q"][:, 6:],
+            raw["generation_initial_q"][:, 6:],
+        )
+        self.assertFalse(
+            np.array_equal(
+                raw["generation_released_initial_q"][:, 3:6],
+                raw["generation_initial_q"][:, 3:6],
+            )
+        )
+        self.assertEqual(validate_run_outputs(output_root)["status"], "valid")
 
     def test_candidate_failure_invalidates_scene_without_normal_artifact(self):
         output_root = self.root / "failure-output"

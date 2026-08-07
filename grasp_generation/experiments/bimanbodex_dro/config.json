@@ -51,6 +51,16 @@
       "offset": 0
     }
   },
+  "production": {
+    "mode": "unfiltered_baseline",
+    "batch_size": 100,
+    "target_count": 20,
+    "max_batches": null,
+    "selection_seed": 240826,
+    "filter_stage": "grasp",
+    "filter_root_link": "palm",
+    "table_margin": 0.0
+  },
   "n_iter": 64,
   "device": "cuda:0",
   "failure_policy": "scene_atomic_all_candidates_fail",
