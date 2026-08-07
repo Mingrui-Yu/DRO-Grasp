@@ -1,0 +1,8 @@
+# Very small: exact scale 0.02.
+core_bottle_134c723696216addedee8d59893c8633/tabletop_ur10e/scale002_pose000_0
+
+# Medium: DGN2k scale011 bucket, persisted exact scale 0.106.
+sem_Bottle_9afea0432f292379dc0e610397fef7f9/tabletop_ur10e/scale011_pose000_0
+
+# Very large: exact scale 0.30.
+core_bottle_eded10bf44a2571a911cff0cb398f845/tabletop_ur10e/scale030_pose000_0

@@ -59,11 +59,11 @@ collision loss or execution-path check.
   root translation and `q[6:]` match for each paired candidate. The CPU and
   applicable CUDA Torch RNG-state digests are captured immediately before
   network forward to verify identical validation latent state.
-- Filtered production budget: `tabletop_filtered` generates complete batches of
-  100 candidates. Each batch is five unchanged 20-slot initialization groups,
-  so the existing initialization proposal contract is reused rather than
-  redefined. Valid candidates accumulate across batches until at least 20 are
-  available or the explicit positive `max_batches` limit is reached.
+- Filtered production budget: `tabletop_filtered` generates complete batches
+  whose size is a positive multiple of the unchanged 20-slot initialization
+  group. Valid candidates accumulate across batches until at least 20 are
+  available or the explicit positive `max_batches` limit is reached. Therefore
+  `batch_size * max_batches` is the hard generated-candidate cap per scene.
 - Final-pose table filter: only the export-clamped `grasp_qpos` corresponding to
   `predict_q` is checked. The model parses the released URDF `collision`
   geometry and selects `palm` plus all kinematic descendants; `forearm`,
@@ -332,3 +332,63 @@ and may only be described as tabletop-oriented/table-conditioned initialization.
 palm-and-descendants table-plane filter. They are not evidence of collision-free
 approach paths, object/self-collision freedom, simulation success, stability, or
 real-robot executability.
+
+## Issue #47 bounded three-scale comparison
+
+The Issue #47 config resolves exactly three bottle-like DGN2k tabletop scenes:
+
+- `scale002`, persisted actual scale `0.02`;
+- `scale011`, persisted actual scale `0.106` (the dataset bucket is not exact `0.11`);
+- `scale030`, persisted actual scale `0.30`.
+
+It intentionally clears `reference_grasp_roots`, uses the checked-in scene list,
+and pins the three-scene manifest hash. Its filtered budget is one 20-candidate
+initialization group per batch and at most five batches, so each scene stops as
+soon as 20 valid grasps exist and can never generate more than 100 candidates.
+Per-candidate timings are printed during official inference, and
+`progress_manifest.json` is atomically updated after every completed batch.
+Dry-run the exact bounded contract before starting CUDA inference:
+
+```bash
+DRO_PYTHON="${DRO_PYTHON:-../.conda-envs/dro/bin/python}"
+"$DRO_PYTHON" grasp_generation/scripts/generate_bimanbodex_dro.py \
+  --config grasp_generation/experiments/bimanbodex_dro/config_issue47_three_scale.json \
+  --dry-run
+```
+
+After confirming a new output path and CUDA device mapping, run the filtered
+production without changing the 20-candidate target:
+
+```bash
+CUDA_VISIBLE_DEVICES=<PHYSICAL_GPU> "$DRO_PYTHON" \
+  grasp_generation/scripts/generate_bimanbodex_dro.py \
+  --config grasp_generation/experiments/bimanbodex_dro/config_issue47_three_scale.json \
+  --output-root output/issue47-three-scale-tabletop-filtered-<RUN_ID>
+```
+
+Validate all terminal manifests and artifacts before visualization:
+
+```bash
+"$DRO_PYTHON" grasp_generation/scripts/validate_bimanbodex_dro_outputs.py \
+  output/issue47-three-scale-tabletop-filtered-<RUN_ID>
+```
+
+The comparison viewer uses one output root and exactly three repeated `--scene`
+arguments in the desired left-to-right order. It keeps all persisted geometry in
+metres and applies only centered display translations. Candidate sliders are
+independent; the default Web view shows exported `grasp` only, with optional
+pregrasp, squeeze, point-cloud, table, and coordinate-axis controls.
+
+```bash
+"$DRO_PYTHON" grasp_generation/scripts/visualize_bimanbodex_dro_comparison.py \
+  --output-root output/issue47-three-scale-tabletop-filtered-<RUN_ID> \
+  --scene core_bottle_134c723696216addedee8d59893c8633/tabletop_ur10e/scale002_pose000_0 \
+  --scene sem_Bottle_9afea0432f292379dc0e610397fef7f9/tabletop_ur10e/scale011_pose000_0 \
+  --scene core_bottle_eded10bf44a2571a911cff0cb398f845/tabletop_ur10e/scale030_pose000_0 \
+  --host 127.0.0.1 --port 8080
+```
+
+Use `--prepare-only` for a read-only CPU contract check before opening the port.
+The finite table patch is only a visualization of the authoritative infinite
+plane; it is not a collision boundary. The viewer does not run Bench dynamics,
+rank candidates, or establish physical grasp success.

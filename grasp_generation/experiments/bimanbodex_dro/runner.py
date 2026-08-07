@@ -218,8 +218,6 @@ def _resolve_production_config(value, candidate_count: int) -> dict:
             raise ValueError(f"production {name} must be a positive integer")
     if resolved["target_count"] != candidate_count:
         raise ValueError("production target_count must match candidate_count=20")
-    if resolved["batch_size"] != 100:
-        raise ValueError("production batch_size must remain the approved 100 candidates")
     if resolved["batch_size"] % candidate_count != 0:
         raise ValueError("production batch_size must be divisible by candidate_count")
 
@@ -533,6 +531,8 @@ class OfficialDROInference:
         object_pc = torch.from_numpy(object_points).to(self.device).unsqueeze(0)
 
         for candidate_index, candidate_seed in enumerate(candidate_seeds):
+            candidate_started = time.perf_counter()
+            candidate_status = "completed"
             try:
                 random.seed(candidate_seed)
                 np.random.seed(candidate_seed)
@@ -584,6 +584,7 @@ class OfficialDROInference:
                     (q_outer[0], q_grasp_cpu[0], q_inner[0]), dim=0
                 ).numpy()
             except Exception as error:  # Candidate failures are evidence, not silent drops.
+                candidate_status = f"failed:{type(error).__name__}"
                 failures.append(
                     {
                         "candidate_index": candidate_index,
@@ -591,6 +592,15 @@ class OfficialDROInference:
                         "error_type": type(error).__name__,
                         "message": str(error),
                     }
+                )
+            finally:
+                print(
+                    "[DRO] "
+                    f"scene={record.scene_id} "
+                    f"candidate={candidate_index + 1}/{candidate_count} "
+                    f"status={candidate_status} "
+                    f"wall_seconds={time.perf_counter() - candidate_started:.3f}",
+                    flush=True,
                 )
         return {
             "released_initial_q": released_initial_q,
@@ -786,6 +796,7 @@ def _run_tabletop_filtered_scene(
     palm_fk: dict,
     shadow_finger_joint_limits: dict,
     collision_model: TabletopCollisionModel,
+    progress_callback=None,
 ) -> tuple[dict | None, dict, dict | None, dict]:
     """Generate/filter batches and return one selected 20-candidate scene."""
 
@@ -982,6 +993,8 @@ def _run_tabletop_filtered_scene(
                     "cumulative_valid_count": len(valid_generation_indices),
                 }
             )
+            if progress_callback is not None:
+                progress_callback(dict(batch_summaries[-1]))
         if fatal_failure is not None or len(valid_generation_indices) >= target_count:
             break
 
@@ -1217,6 +1230,15 @@ def run(repo_root: Path, config: dict, inference=None) -> dict:
     _atomic_json(output_root / "resolved_config.json", resolved)
     _atomic_json(output_root / "run_manifest.json", manifest)
     _atomic_json(output_root / "failure_manifest.json", failure_manifest)
+    progress_manifest = {
+        "schema_version": run_schema_version,
+        "status": "running",
+        "started_at": manifest["started_at"],
+        "completed_scene_count": 0,
+        "scene_count": len(records),
+        "active_scene": None,
+    }
+    _atomic_json(output_root / "progress_manifest.json", progress_manifest)
 
     manifest["inference_environment"] = getattr(
         inference, "environment_manifest", {"injected_test_inference": True}
@@ -1236,6 +1258,45 @@ def run(repo_root: Path, config: dict, inference=None) -> dict:
                 output_root, record.scene_id
             )
             if filtered_production:
+                progress_manifest["active_scene"] = {
+                    "scene_id": record.scene_id,
+                    "scale": record.scale,
+                    "status": "running",
+                    "completed_batch_count": 0,
+                    "generated_candidate_count": 0,
+                    "valid_candidate_count": 0,
+                    "table_rejected_candidate_count": 0,
+                    "inference_failed_candidate_count": 0,
+                }
+                _atomic_json(output_root / "progress_manifest.json", progress_manifest)
+
+                def update_scene_progress(batch_summary):
+                    active = progress_manifest["active_scene"]
+                    active.update(
+                        {
+                            "completed_batch_count": batch_summary["batch_index"] + 1,
+                            "generated_candidate_count": (
+                                active["generated_candidate_count"]
+                                + batch_summary["generated_count"]
+                            ),
+                            "valid_candidate_count": batch_summary[
+                                "cumulative_valid_count"
+                            ],
+                            "table_rejected_candidate_count": (
+                                active["table_rejected_candidate_count"]
+                                + batch_summary["table_rejected_count"]
+                            ),
+                            "inference_failed_candidate_count": (
+                                active["inference_failed_candidate_count"]
+                                + batch_summary["inference_failed_count"]
+                            ),
+                            "latest_batch": batch_summary,
+                        }
+                    )
+                    _atomic_json(
+                        output_root / "progress_manifest.json", progress_manifest
+                    )
+
                 artifact, raw, scene_failure, production_summary = (
                     _run_tabletop_filtered_scene(
                         record=record,
@@ -1248,6 +1309,7 @@ def run(repo_root: Path, config: dict, inference=None) -> dict:
                         palm_fk=palm_fk,
                         shadow_finger_joint_limits=shadow_finger_joint_limits,
                         collision_model=collision_model,
+                        progress_callback=update_scene_progress,
                     )
                 )
                 scene_record = record.to_manifest()
@@ -1292,6 +1354,14 @@ def run(repo_root: Path, config: dict, inference=None) -> dict:
                 manifest["scenes"].append(scene_record)
                 _atomic_json(output_root / "run_manifest.json", manifest)
                 _atomic_json(output_root / "failure_manifest.json", failure_manifest)
+                progress_manifest["completed_scene_count"] += 1
+                progress_manifest["active_scene"].update(
+                    {
+                        "status": scene_record["status"],
+                        "production": production_summary,
+                    }
+                )
+                _atomic_json(output_root / "progress_manifest.json", progress_manifest)
                 continue
 
             candidate_seeds = [
@@ -1453,11 +1523,28 @@ def run(repo_root: Path, config: dict, inference=None) -> dict:
             path.stat().st_size for path in output_root.rglob("*") if path.is_file()
         )
         _atomic_json(output_root / "run_manifest.json", manifest)
+        progress_manifest.update(
+            {
+                "status": manifest["status"],
+                "completed_at": manifest["completed_at"],
+                "completed_scene_count": len(manifest["scenes"]),
+            }
+        )
+        _atomic_json(output_root / "progress_manifest.json", progress_manifest)
         return manifest
-    except Exception:
+    except Exception as error:
         manifest["status"] = "failed"
         manifest["completed_at"] = utc_now()
         _atomic_json(output_root / "run_manifest.json", manifest)
+        progress_manifest.update(
+            {
+                "status": "failed",
+                "completed_at": manifest["completed_at"],
+                "error_type": type(error).__name__,
+                "message": str(error),
+            }
+        )
+        _atomic_json(output_root / "progress_manifest.json", progress_manifest)
         raise
 
 

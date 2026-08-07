@@ -365,7 +365,7 @@ class RunnerTests(unittest.TestCase):
         invalid_values = (
             ("max_batches", None, "explicit max_batches"),
             ("selection_seed", None, "explicit selection_seed"),
-            ("batch_size", 99, "approved 100"),
+            ("batch_size", 99, "divisible by candidate_count"),
             ("target_count", 19, "match candidate_count"),
             ("filter_stage", "pregrasp", "final grasp_qpos"),
             ("filter_root_link", "wrist", "remain palm"),
@@ -377,6 +377,36 @@ class RunnerTests(unittest.TestCase):
                 config["production"][name] = value
                 with self.assertRaisesRegex(ValueError, message):
                     resolve_config(self.repo_root, config)
+
+    def test_filtered_production_supports_one_twenty_candidate_group_per_batch(self):
+        output_root = self.root / "filtered-twenty-batch-output"
+        config = self.filtered_config(output_root, max_batches=5, selection_seed=106)
+        config["production"]["batch_size"] = 20
+        inference = self.filtered_inference(lambda _batch, _candidate: True)
+
+        manifest = run(self.repo_root, config, inference)
+
+        self.assertEqual(inference.call_count, 1)
+        self.assertEqual(manifest["generated_candidate_count"], 20)
+        self.assertEqual(manifest["table_collision_free_candidate_count"], 20)
+        raw_path = output_root / "raw" / "object_a" / "floating" / "scale013.npy"
+        raw = np.load(raw_path, allow_pickle=True).item()
+        self.assertEqual(raw["production_config"]["groups_per_batch"], 1)
+        self.assertEqual(raw["batch_summaries"], [
+            {
+                "batch_index": 0,
+                "generated_count": 20,
+                "table_collision_free_count": 20,
+                "table_rejected_count": 0,
+                "inference_failed_count": 0,
+                "cumulative_valid_count": 20,
+            }
+        ])
+        progress = json.loads((output_root / "progress_manifest.json").read_text())
+        self.assertEqual(progress["status"], "completed")
+        self.assertEqual(progress["completed_scene_count"], 1)
+        self.assertEqual(progress["active_scene"]["generated_candidate_count"], 20)
+        self.assertEqual(progress["active_scene"]["valid_candidate_count"], 20)
 
     def test_success_writes_shape_1_20_3_29_and_exact_accounting(self):
         output_root = self.root / "success-output"

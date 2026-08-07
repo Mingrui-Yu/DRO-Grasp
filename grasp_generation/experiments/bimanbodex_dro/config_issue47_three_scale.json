@@ -1,0 +1,67 @@
+{
+  "robot_name": "shadowhand",
+  "scene_root": "../BimanBODex/src/curobo/content/assets/object/DGN_2k/scene_cfg",
+  "reference_grasp_roots": [],
+  "scene_list": "grasp_generation/experiments/bimanbodex_dro/scene_lists/issue47_three_scale.txt",
+  "expected_scene_count": 3,
+  "expected_scene_manifest_sha256": "9b259ee3d7384881bcfbaea784d7a24df85f6bf2641775fbfd498ea47e7cccf9",
+  "expected_scale_range": [0.02, 0.30],
+  "checkpoint": "ckpt/model/model_3robots.pth",
+  "shadow_urdf": "data/data_urdf/robot/shadowhand/shadow_hand_right_extended.urdf",
+  "shadow_point_cloud": "data/PointCloud/robot/shadowhand.pt",
+  "point_cloud_mode": "complete_scaled_mesh",
+  "frame_contract": "object_local_no_normalization",
+  "network_center_robot_pc": true,
+  "point_count": 512,
+  "point_seed": 240824,
+  "candidate_count": 20,
+  "inference_seed": 240825,
+  "initialization": {
+    "mode": "tabletop_stratified",
+    "palm_approach_axis_local": [0.0, 1.0, 0.0],
+    "palm_approach_axis_sign": "object_to_palm",
+    "candidate_ordering": [
+      {
+        "family": "top_down",
+        "count": 6,
+        "elevation_range_deg": [60.0, 90.0]
+      },
+      {
+        "family": "oblique",
+        "count": 8,
+        "elevation_range_deg": [20.0, 60.0]
+      },
+      {
+        "family": "near_horizontal",
+        "count": 6,
+        "elevation_range_deg": [0.0, 20.0]
+      }
+    ],
+    "elevation_stratification": "family_midpoints",
+    "azimuth": {
+      "range_deg": [0.0, 360.0],
+      "stratification": "family_midpoints"
+    },
+    "roll": {
+      "range_deg": [0.0, 360.0],
+      "stratification": "global_permuted_midpoints",
+      "stride": 7,
+      "offset": 0
+    }
+  },
+  "production": {
+    "mode": "tabletop_filtered",
+    "batch_size": 20,
+    "target_count": 20,
+    "max_batches": 5,
+    "selection_seed": 240826,
+    "filter_stage": "grasp",
+    "filter_root_link": "palm",
+    "table_margin": 0.0
+  },
+  "n_iter": 64,
+  "device": "cuda:0",
+  "failure_policy": "scene_atomic_all_candidates_fail",
+  "output_root": null,
+  "max_scenes": null
+}
