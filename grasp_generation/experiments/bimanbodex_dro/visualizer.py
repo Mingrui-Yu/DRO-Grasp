@@ -1095,7 +1095,12 @@ class ViewerRun:
             )
         if not np.isfinite(robot_pose).all():
             raise ValueError(f"robot_pose contains non-finite values for {scene_id}")
-        if not np.array_equal(robot_pose, expected_artifact["robot_pose"]):
+        if not np.allclose(
+            robot_pose,
+            expected_artifact["robot_pose"],
+            rtol=0.0,
+            atol=1e-6,
+        ):
             raise ValueError(f"persisted robot_pose round-trip mismatch for {scene_id}")
         validate_artifact(
             artifact,

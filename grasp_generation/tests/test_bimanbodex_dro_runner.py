@@ -449,6 +449,24 @@ class RunnerTests(unittest.TestCase):
         )
         artifact = np.load(artifact_path, allow_pickle=True).item()
         self.assertEqual(artifact["robot_pose"].shape, (1, 20, 3, 29))
+
+        raw["generation_export_clamp_diagnostics"] = list(
+            reversed(raw["generation_export_clamp_diagnostics"])
+        )
+        np.save(raw_path, raw, allow_pickle=True)
+        original_pose_value = artifact["robot_pose"][0, 0, 0, 0]
+        artifact["robot_pose"][0, 0, 0, 0] = np.nextafter(
+            original_pose_value,
+            np.float32(np.inf),
+        )
+        self.assertGreater(
+            artifact["robot_pose"][0, 0, 0, 0], original_pose_value
+        )
+        self.assertLess(
+            float(artifact["robot_pose"][0, 0, 0, 0] - original_pose_value),
+            1e-6,
+        )
+        np.save(artifact_path, artifact, allow_pickle=True)
         validation = validate_run_outputs(output_root)
         self.assertEqual(validation["generated_candidate_count"], 100)
         loaded = ViewerRun(output_root).load_scene("object_a/floating/scale013")

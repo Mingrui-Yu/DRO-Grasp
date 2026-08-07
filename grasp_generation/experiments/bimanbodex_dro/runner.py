@@ -763,6 +763,17 @@ def _source_record(
     }
 
 
+def _generation_clamp_diagnostic_sort_key(value: dict) -> tuple:
+    """Return the canonical order for generated-candidate clamp evidence."""
+
+    return (
+        value["generation_index"],
+        value["stage_index"],
+        value["dro_joint_name"],
+        value["bench_joint_name"],
+    )
+
+
 def _run_tabletop_filtered_scene(
     *,
     record,
@@ -993,6 +1004,7 @@ def _run_tabletop_filtered_scene(
 
     selection_seed = _stable_seed(production["selection_seed"], record.scene_id)
     collision_model_manifest = collision_model.to_manifest()
+    generation_clamp_diagnostics.sort(key=_generation_clamp_diagnostic_sort_key)
     raw = {
         "schema_version": FILTERED_RAW_SCHEMA_VERSION,
         "scene": record.to_manifest(),
@@ -1708,7 +1720,27 @@ def _validate_v3_filtered_raw(
             remapped = dict(diagnostic)
             remapped.update(sources[generation_index])
             expected_generation_clamp_diagnostics.append(remapped)
-    if raw.get("generation_export_clamp_diagnostics") != expected_generation_clamp_diagnostics:
+    persisted_generation_clamp_diagnostics = raw.get(
+        "generation_export_clamp_diagnostics"
+    )
+    if not isinstance(persisted_generation_clamp_diagnostics, list):
+        raise ValueError(f"generated clamp diagnostics mismatch for {record.scene_id}")
+    try:
+        persisted_generation_clamp_diagnostics = sorted(
+            persisted_generation_clamp_diagnostics,
+            key=_generation_clamp_diagnostic_sort_key,
+        )
+        expected_generation_clamp_diagnostics.sort(
+            key=_generation_clamp_diagnostic_sort_key
+        )
+    except (KeyError, TypeError):
+        raise ValueError(
+            f"generated clamp diagnostics mismatch for {record.scene_id}"
+        ) from None
+    if (
+        persisted_generation_clamp_diagnostics
+        != expected_generation_clamp_diagnostics
+    ):
         raise ValueError(f"generated clamp diagnostics mismatch for {record.scene_id}")
 
     expected_filter_diagnostics = [None] * generated_count
@@ -2024,7 +2056,12 @@ def validate_run_outputs(output_root: Path) -> dict:
                 persisted_excess, expected_excess
             ):
                 raise ValueError(f"joint-limit diagnostics mismatch for {record.scene_id}")
-            if not np.array_equal(artifact["robot_pose"], expected_artifact["robot_pose"]):
+            if not np.allclose(
+                artifact["robot_pose"],
+                expected_artifact["robot_pose"],
+                rtol=0.0,
+                atol=1e-6,
+            ):
                 raise ValueError(f"artifact export mismatch for {record.scene_id}")
             validate_artifact(
                 artifact,

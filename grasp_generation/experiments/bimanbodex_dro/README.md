@@ -312,7 +312,8 @@ The loader requires the terminal `run_manifest.json`, matching
 `resolved_config.json` and `failure_manifest.json`, every completed
 `graspdata/`/`raw/` pair, exact scene/mesh hashes, `wxyz` object pose, isotropic
 scale, stage and joint order, finite `float32` arrays, approved clamp result,
-and exact `export_stage_q` to persisted `robot_pose` round-trip. Failed scenes
+and `export_stage_q` to persisted `robot_pose` round-trip within `1e-6`
+absolute tolerance for GPU/CPU float32 FK reproducibility. Failed scenes
 are reported in diagnostics but are never offered as renderable grasps.
 
 All geometry is constructed on CPU in the saved world frame using
