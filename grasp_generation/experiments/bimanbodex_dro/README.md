@@ -4,8 +4,11 @@ This experiment adapter runs the released complete-point-cloud DRO-Grasp model
 on the same ShadowHand DGN2k scene contract used by the project baselines. It
 does not train or modify the network or invoke the official Isaac Gym evaluator.
 It supports a strict initialization ablation between the released random root
-orientation and deterministic tabletop-oriented proposals; neither mode adds a
-table collision loss, rejection step, or execution-path check.
+orientation and deterministic tabletop-oriented proposals. The default
+`unfiltered_baseline` production mode retains the original no-rejection
+denominator. The separate `tabletop_filtered` production mode performs an
+explicit final-grasp table-plane rejection after generation; it does not add a
+collision loss or execution-path check.
 
 ## Fixed contracts
 
@@ -50,15 +53,34 @@ table collision loss, rejection step, or execution-path check.
   `controller(predict_q)` output is exported as `q_outer -> pregrasp`,
   `predict_q -> grasp`, and `q_inner -> squeeze`; `isaac_q` is not substituted
   for any of these three stages. Palm FK is evaluated separately for all three.
-- Budget: exactly 20 raw candidates per scene. Candidate seeds and ordering are
-  stable and recorded. Both modes consume the released sampler before any
-  override, so root translation and `q[6:]` match for each paired candidate.
-  The CPU and applicable CUDA Torch RNG-state digests are captured immediately
-  before network forward to verify identical validation latent state.
-- Failure policy: outputs are scene-atomic. If any candidate fails inference or
-  export validation, no normal Bench artifact is written for that scene and all
-  20 candidates are conservatively counted as failed. Partial raw diagnostics
-  remain under `failed_raw/`; candidates are never resampled.
+- Baseline budget: `unfiltered_baseline` generates exactly 20 raw candidates
+  per scene. Candidate seeds and ordering are stable and recorded. Both
+  initialization modes consume the released sampler before any override, so
+  root translation and `q[6:]` match for each paired candidate. The CPU and
+  applicable CUDA Torch RNG-state digests are captured immediately before
+  network forward to verify identical validation latent state.
+- Filtered production budget: `tabletop_filtered` generates complete batches of
+  100 candidates. Each batch is five unchanged 20-slot initialization groups,
+  so the existing initialization proposal contract is reused rather than
+  redefined. Valid candidates accumulate across batches until at least 20 are
+  available or the explicit positive `max_batches` limit is reached.
+- Final-pose table filter: only the export-clamped `grasp_qpos` corresponding to
+  `predict_q` is checked. The model parses the released URDF `collision`
+  geometry and selects `palm` plus all kinematic descendants; `forearm`,
+  `wrist`, and every other palm ancestor are excluded. Signed height is measured
+  against the explicit scene table plane with `margin = 0`, and every included
+  geometry must satisfy strict `min_z > 0`. `pregrasp`, `squeeze`, interpolation,
+  approach, arm paths, object collision, and self-collision are not checked.
+- Filtered selection: after reaching the target, a persisted scene-specific Seed
+  drives uniform random sampling without replacement from all accumulated valid
+  candidates. No score, top-k, quality weighting, diversity ranking, deduplication,
+  or manual choice is used. Source batch/candidate/proposal indices and generation
+  and selection Seeds are persisted for every selected grasp.
+- Failure policy: baseline outputs remain scene-atomic under their original
+  20-candidate policy. Filtered production records individual inference failures
+  and continues accumulating other candidates; structural inference/filter/export
+  failures or reaching `max_batches` below 20 valid grasps fail the scene without
+  relaxing the filter, duplicating grasps, or writing a short artifact.
 
 The Bench-facing artifact remains unchanged:
 
@@ -77,13 +99,18 @@ Each successful raw artifact stores `stage_q` as the untouched official
 `q_outer/q/q_inner` result and `export_stage_q` as the Bench-facing clamped
 copy. `export_clamp_diagnostics` records the candidate, stage, joint, raw and
 clamped values, delta, and both source limit intervals for every clamp.
-New runs use `drograsp.dgn2k.raw.v2` / `drograsp.dgn2k.run.v2` and additionally
+Unfiltered runs use `drograsp.dgn2k.raw.v2` / `drograsp.dgn2k.run.v2` and
+additionally
 store `released_initial_q`, effective `initial_q`, initialization metadata, the
 explicit table contract, pre-network RNG digests, and `palm_fk` provenance
 (`backend`, link, joint order, URDF SHA256, dtype, and device). Validators and
 the viewer retain read-only support for #24 artifacts without `palm_fk` by
 using the old hand-written formula only as an explicit historical compatibility
-path; new writes always use actual PK FK and are v2.
+path; new writes always use actual PK FK. Filtered production uses
+`drograsp.dgn2k.raw.v3` / `drograsp.dgn2k.run.v3`: the canonical selected fields
+remain 20-candidate viewer/Bench-compatible arrays, while `generation_*`,
+`batch_summaries`, filter diagnostics, selection indices, and source provenance
+retain all generated candidates.
 
 ## Assets and environment
 
@@ -146,6 +173,21 @@ python grasp_generation/scripts/generate_bimanbodex_dro.py \
   --dry-run
 ```
 
+The checked-in config defaults to `unfiltered_baseline`. A filtered dry-run must
+name the production mode and the run-specific safety cap explicitly. It parses
+all palm-scope collision assets but does not start inference or create an output
+root:
+
+```bash
+python grasp_generation/scripts/generate_bimanbodex_dro.py \
+  --config grasp_generation/experiments/bimanbodex_dro/config.json \
+  --initialization-mode tabletop_stratified \
+  --production-mode tabletop_filtered \
+  --max-batches 10 \
+  --selection-seed 240826 \
+  --dry-run
+```
+
 After GPU authorization, use a new output root:
 
 ```bash
@@ -159,6 +201,21 @@ DRO_PYTHON="${DRO_PYTHON:-../.conda-envs/dro/bin/python}"
 
 The one-scene command is only the bounded GPU smoke. Remove `--max-scenes 1`
 only after separate approval for the formal 996-scene run.
+
+After separate GPU/output authorization, the corresponding bounded filtered
+smoke uses a new output root:
+
+```bash
+DRO_PYTHON="${DRO_PYTHON:-../.conda-envs/dro/bin/python}"
+"$DRO_PYTHON" grasp_generation/scripts/generate_bimanbodex_dro.py \
+  --config grasp_generation/experiments/bimanbodex_dro/config.json \
+  --initialization-mode tabletop_stratified \
+  --production-mode tabletop_filtered \
+  --max-batches 10 \
+  --selection-seed 240826 \
+  --max-scenes 1 \
+  --output-root /path/to/new/issue42-tabletop-filtered-seed240826
+```
 
 Revalidate the persisted raw/artifact contract independently:
 
@@ -268,6 +325,9 @@ interpreted as tabletop success or collision-free generation.
 
 The current Bench tabletop protocol is the only evaluation target. The network
 still does not receive table points and the adapter adds no table-collision
-objective or post-filter. Results may only be described as the effect of
-tabletop-oriented/table-conditioned initialization under that protocol, not as
-native table-collision-aware or collision-free generation.
+objective. Initialization ablations must continue to use `unfiltered_baseline`
+and may only be described as tabletop-oriented/table-conditioned initialization.
+`tabletop_filtered` results may be described only as passing the final
+palm-and-descendants table-plane filter. They are not evidence of collision-free
+approach paths, object/self-collision freedom, simulation success, stability, or
+real-robot executability.

@@ -16,7 +16,7 @@ if str(GRASP_GENERATION_ROOT) not in sys.path:
     sys.path.insert(0, str(GRASP_GENERATION_ROOT))
 
 from experiments.bimanbodex_dro.initialization import INITIALIZATION_MODES
-from experiments.bimanbodex_dro.runner import dry_run, run
+from experiments.bimanbodex_dro.runner import PRODUCTION_MODES, dry_run, run
 
 
 def main() -> None:
@@ -27,6 +27,9 @@ def main() -> None:
     parser.add_argument("--scene-list", type=Path)
     parser.add_argument("--max-scenes", type=int)
     parser.add_argument("--initialization-mode", choices=INITIALIZATION_MODES)
+    parser.add_argument("--production-mode", choices=PRODUCTION_MODES)
+    parser.add_argument("--max-batches", type=int)
+    parser.add_argument("--selection-seed", type=int)
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parents[2]
@@ -39,6 +42,12 @@ def main() -> None:
         config["max_scenes"] = args.max_scenes
     if args.initialization_mode is not None:
         config.setdefault("initialization", {})["mode"] = args.initialization_mode
+    if args.production_mode is not None:
+        config.setdefault("production", {})["mode"] = args.production_mode
+    if args.max_batches is not None:
+        config.setdefault("production", {})["max_batches"] = args.max_batches
+    if args.selection_seed is not None:
+        config.setdefault("production", {})["selection_seed"] = args.selection_seed
 
     result = dry_run(repo_root, config) if args.dry_run else run(repo_root, config)
     print(json.dumps(result, indent=2, sort_keys=True, default=str))
