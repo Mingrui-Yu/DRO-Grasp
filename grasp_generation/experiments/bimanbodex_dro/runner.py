@@ -194,9 +194,9 @@ def _resolve_production_config(value, candidate_count: int) -> dict:
 
     defaults = {
         "mode": "unfiltered_baseline",
-        "batch_size": 100,
+        "batch_size": candidate_count,
         "target_count": candidate_count,
-        "max_batches": None,
+        "max_batches": 1,
         "selection_seed": None,
         "filter_stage": "grasp",
         "filter_root_link": "palm",
@@ -248,15 +248,15 @@ def _resolve_production_config(value, candidate_count: int) -> dict:
         raise ValueError("production table_margin must remain exactly 0")
 
     if resolved["mode"] == "tabletop_filtered":
-        if resolved["batch_size"] != 100:
+        if resolved["batch_size"] != candidate_count:
             raise ValueError(
-                "tabletop_filtered production batch_size must remain exactly 100"
+                "tabletop_filtered production batch_size must match candidate_count=20"
             )
         if max_batches is None:
             raise ValueError("tabletop_filtered production requires explicit max_batches")
-        if max_batches != 5:
+        if max_batches != 1:
             raise ValueError(
-                "tabletop_filtered production max_batches must remain exactly 5"
+                "tabletop_filtered production max_batches must remain exactly 1"
             )
         if selection_seed is None:
             raise ValueError("tabletop_filtered production requires explicit selection_seed")

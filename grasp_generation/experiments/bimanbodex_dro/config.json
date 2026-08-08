@@ -53,9 +53,9 @@
   },
   "production": {
     "mode": "unfiltered_baseline",
-    "batch_size": 100,
+    "batch_size": 20,
     "target_count": 20,
-    "max_batches": null,
+    "max_batches": 1,
     "selection_seed": 240826,
     "filter_stage": "grasp",
     "filter_root_link": "palm",
